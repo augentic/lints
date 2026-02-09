@@ -7,6 +7,7 @@ use tower_lsp::lsp_types::*;
 use tracing::debug;
 
 use crate::qwasr::{ForbiddenPattern, QwasrContext, RuleSet, RuleSeverity, Severity};
+use crate::semantic::SemanticAnalyzer;
 
 /// Diagnostics engine for QWASR code analysis.
 pub struct DiagnosticsEngine {
@@ -24,6 +25,9 @@ pub struct DiagnosticsEngine {
 
     /// Compiled regex for forbidden crate detection in extern crate.
     crate_extern_pattern: Regex,
+
+    /// Semantic analyzer for deeper code analysis.
+    semantic_analyzer: SemanticAnalyzer,
 }
 
 /// Check if a position (byte offset from start of content) falls inside a string literal.
@@ -142,12 +146,15 @@ impl DiagnosticsEngine {
             })
             .collect();
 
+        let semantic_analyzer = SemanticAnalyzer::new(Arc::clone(&context));
+
         Self {
             context,
             rule_set: RuleSet::new(),
             compiled_patterns,
             crate_use_pattern: Regex::new(r"use\s+(\w+)(?:::|;)").unwrap(),
             crate_extern_pattern: Regex::new(r"extern\s+crate\s+(\w+)").unwrap(),
+            semantic_analyzer,
         }
     }
 
@@ -231,6 +238,10 @@ impl DiagnosticsEngine {
 
         // Check for missing provider trait bounds
         diagnostics.extend(self.check_provider_bounds(content));
+
+        // Perform semantic analysis for provider bounds and unused traits
+        let semantic_result = self.semantic_analyzer.analyze(content);
+        diagnostics.extend(semantic_result.diagnostics);
 
         debug!("Found {} diagnostics", diagnostics.len());
         diagnostics

@@ -14,6 +14,7 @@ mod diagnostics;
 mod handlers;
 pub mod llm;
 mod qwasr;
+mod semantic;
 
 // Re-export linter from the library
 pub use qwasr_lsp::linter;

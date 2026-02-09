@@ -55,10 +55,6 @@ path = "src/lib.rs"
 name = "qwasr-lsp"
 path = "src/main.rs"
 
-[[bin]]
-name = "lint-test"
-path = "src/bin/lint_test.rs"
-
 [profile.release]
 lto = true
 codegen-units = 1
