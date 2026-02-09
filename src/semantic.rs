@@ -324,6 +324,33 @@ impl SemanticAnalyzer {
 
         for declared in &handler.declared_bounds {
             if !handler.used_traits.contains(declared) {
+                // Calculate the fix: remove the unused trait from bounds
+                let new_bounds: Vec<_> = handler
+                    .declared_bounds
+                    .iter()
+                    .filter(|b| *b != declared)
+                    .cloned()
+                    .collect();
+
+                let fix_text = if new_bounds.is_empty() {
+                    format!("impl<P> Handler<P> for {}", handler.request_type)
+                } else {
+                    format!(
+                        "impl<P: {}> Handler<P> for {}",
+                        new_bounds.join(" + "),
+                        handler.request_type
+                    )
+                };
+
+                // Store fix data as JSON in the diagnostic
+                let fix_data = serde_json::json!({
+                    "fix_type": "remove_unused_bound",
+                    "unused_trait": declared,
+                    "new_impl_signature": fix_text,
+                    "request_type": handler.request_type,
+                    "remaining_bounds": new_bounds,
+                });
+
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position {
@@ -342,19 +369,14 @@ impl SemanticAnalyzer {
                         "Unused provider trait bound: `{}`\n\n\
                         The `{}` trait is declared in the bounds for `{}` but is never used in the handler.\n\n\
                         Consider removing it to keep bounds minimal:\n\
-                        `impl<P: {}> Handler<P> for {}`",
+                        `{}`",
                         declared,
                         declared,
                         handler.request_type,
-                        handler
-                            .used_traits
-                            .iter()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(" + "),
-                        handler.request_type
+                        fix_text
                     ),
                     tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+                    data: Some(fix_data),
                     ..Default::default()
                 });
             }
@@ -369,6 +391,26 @@ impl SemanticAnalyzer {
 
         for used in &handler.used_traits {
             if !handler.declared_bounds.contains(used) {
+                // Calculate the fix: add the missing trait to bounds
+                let mut new_bounds: Vec<_> = handler.declared_bounds.iter().cloned().collect();
+                new_bounds.push(used.clone());
+                new_bounds.sort(); // Keep bounds in consistent order
+
+                let fix_text = format!(
+                    "impl<P: {}> Handler<P> for {}",
+                    new_bounds.join(" + "),
+                    handler.request_type
+                );
+
+                // Store fix data as JSON in the diagnostic
+                let fix_data = serde_json::json!({
+                    "fix_type": "add_missing_bound",
+                    "missing_trait": used,
+                    "new_impl_signature": fix_text,
+                    "request_type": handler.request_type,
+                    "all_bounds": new_bounds,
+                });
+
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position {
@@ -387,19 +429,13 @@ impl SemanticAnalyzer {
                         "Missing provider trait bound: `{}`\n\n\
                         The handler for `{}` uses `{}` methods but doesn't declare it in the bounds.\n\n\
                         Add the trait bound:\n\
-                        `impl<P: {}> Handler<P> for {}`",
+                        `{}`",
                         used,
                         handler.request_type,
                         used,
-                        handler
-                            .declared_bounds
-                            .iter()
-                            .chain(std::iter::once(used))
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(" + "),
-                        handler.request_type
+                        fix_text
                     ),
+                    data: Some(fix_data),
                     ..Default::default()
                 });
             }
@@ -481,6 +517,15 @@ impl SemanticAnalyzer {
         let set_no_ttl_re = Regex::new(r"provider\.set\s*\([^,]+,[^,]+,\s*None\s*\)").unwrap();
         for (line_idx, line) in lines.iter().enumerate() {
             if set_no_ttl_re.is_match(line) {
+                // Create fix: replace None with Some(Duration::from_secs(3600))
+                let fixed_line = line.replace(", None)", ", Some(Duration::from_secs(3600)))");
+
+                let fix_data = serde_json::json!({
+                    "fix_type": "add_ttl",
+                    "original_line": line,
+                    "fixed_line": fixed_line,
+                });
+
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position {
@@ -496,6 +541,7 @@ impl SemanticAnalyzer {
                     code: Some(NumberOrString::String("statestore_no_ttl".to_string())),
                     source: Some("qwasr".to_string()),
                     message: "StateStore::set with None TTL - consider adding a TTL to prevent unbounded cache growth.\n\nExample: `Some(Duration::from_secs(3600))`".to_string(),
+                    data: Some(fix_data),
                     ..Default::default()
                 });
             }
@@ -595,6 +641,30 @@ impl SemanticAnalyzer {
                 // Report unused bounds in helper functions
                 for declared in &declared_bounds {
                     if !used_traits.contains(declared) {
+                        // Calculate fix: remove unused trait from bounds
+                        let new_bounds: Vec<_> = declared_bounds
+                            .iter()
+                            .filter(|b| *b != declared)
+                            .cloned()
+                            .collect();
+
+                        let new_signature = if new_bounds.is_empty() {
+                            line.replace(&format!("<P: {}>", declared), "<P>")
+                                .replace(&format!("<P: {} + ", declared), "<P: ")
+                                .replace(&format!(" + {}>", declared), ">")
+                        } else {
+                            // Attempt a simple replacement
+                            line.replace(&format!("{} + ", declared), "")
+                                .replace(&format!(" + {}", declared), "")
+                        };
+
+                        let fix_data = serde_json::json!({
+                            "fix_type": "remove_unused_fn_bound",
+                            "unused_trait": declared,
+                            "new_fn_signature": new_signature,
+                            "fn_name": fn_name,
+                        });
+
                         diagnostics.push(Diagnostic {
                             range: Range {
                                 start: Position {
@@ -617,6 +687,7 @@ impl SemanticAnalyzer {
                                 declared, fn_name
                             ),
                             tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+                            data: Some(fix_data),
                             ..Default::default()
                         });
                     }
@@ -625,6 +696,40 @@ impl SemanticAnalyzer {
                 // Report missing bounds
                 for used in &used_traits {
                     if !declared_bounds.contains(used) && !declared_bounds.is_empty() {
+                        // Calculate fix: add missing trait to bounds
+                        let mut all_bounds: Vec<_> = declared_bounds.iter().cloned().collect();
+                        all_bounds.push(used.clone());
+                        all_bounds.sort();
+
+                        // Find the bounds portion and add the new trait
+                        let new_signature = if line.contains("<P:") {
+                            // Has existing bounds, add to them
+                            line.replace(
+                                &format!(
+                                    "<P: {}",
+                                    declared_bounds.iter().next().unwrap_or(&String::new())
+                                ),
+                                &format!(
+                                    "<P: {} + {}",
+                                    used,
+                                    declared_bounds.iter().next().unwrap_or(&String::new())
+                                ),
+                            )
+                        } else if line.contains("<P>") {
+                            // No bounds, add them
+                            line.replace("<P>", &format!("<P: {}>", used))
+                        } else {
+                            line.to_string()
+                        };
+
+                        let fix_data = serde_json::json!({
+                            "fix_type": "add_missing_fn_bound",
+                            "missing_trait": used,
+                            "new_fn_signature": new_signature,
+                            "fn_name": fn_name,
+                            "all_bounds": all_bounds,
+                        });
+
                         diagnostics.push(Diagnostic {
                             range: Range {
                                 start: Position {
@@ -646,6 +751,7 @@ impl SemanticAnalyzer {
                                 The function uses `{}` methods but doesn't declare it in bounds.",
                                 used, fn_name, used
                             ),
+                            data: Some(fix_data),
                             ..Default::default()
                         });
                     }

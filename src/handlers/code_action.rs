@@ -69,6 +69,12 @@ impl CodeActionHandler {
             "println_debug" => Some(self.fix_println(content, uri, diagnostic)),
             "panic_unwrap" => Some(self.fix_unwrap(content, uri, diagnostic)),
             "forbidden_crate" => self.fix_forbidden_crate(content, uri, diagnostic),
+            // Semantic analysis fixes
+            "unused_provider_bound" => self.fix_unused_provider_bound(content, uri, diagnostic),
+            "missing_provider_bound" => self.fix_missing_provider_bound(content, uri, diagnostic),
+            "statestore_no_ttl" => self.fix_statestore_ttl(content, uri, diagnostic),
+            "unused_fn_provider_bound" => self.fix_unused_fn_bound(content, uri, diagnostic),
+            "missing_fn_provider_bound" => self.fix_missing_fn_bound(content, uri, diagnostic),
             _ => None,
         }
     }
@@ -279,6 +285,234 @@ impl CodeActionHandler {
                 ),
                 ..Default::default()
             }),
+            ..Default::default()
+        }))
+    }
+
+    /// Fix unused provider trait bound by removing it from the impl signature.
+    fn fix_unused_provider_bound(
+        &self,
+        content: &str,
+        uri: &Url,
+        diagnostic: &Diagnostic,
+    ) -> Option<CodeActionOrCommand> {
+        // Extract fix data from diagnostic
+        let fix_data = diagnostic.data.as_ref()?;
+        let new_signature = fix_data.get("new_impl_signature")?.as_str()?;
+        let unused_trait = fix_data.get("unused_trait")?.as_str()?;
+
+        let line = content.lines().nth(diagnostic.range.start.line as usize)?;
+
+        Some(CodeActionOrCommand::CodeAction(CodeAction {
+            title: format!("Remove unused `{}` trait bound", unused_trait),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![diagnostic.clone()]),
+            edit: Some(WorkspaceEdit {
+                changes: Some(
+                    [(
+                        uri.clone(),
+                        vec![TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: diagnostic.range.start.line,
+                                    character: 0,
+                                },
+                                end: Position {
+                                    line: diagnostic.range.start.line,
+                                    character: line.len() as u32,
+                                },
+                            },
+                            new_text: new_signature.to_string(),
+                        }],
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            }),
+            is_preferred: Some(true),
+            ..Default::default()
+        }))
+    }
+
+    /// Fix missing provider trait bound by adding it to the impl signature.
+    fn fix_missing_provider_bound(
+        &self,
+        content: &str,
+        uri: &Url,
+        diagnostic: &Diagnostic,
+    ) -> Option<CodeActionOrCommand> {
+        // Extract fix data from diagnostic
+        let fix_data = diagnostic.data.as_ref()?;
+        let new_signature = fix_data.get("new_impl_signature")?.as_str()?;
+        let missing_trait = fix_data.get("missing_trait")?.as_str()?;
+
+        let line = content.lines().nth(diagnostic.range.start.line as usize)?;
+
+        Some(CodeActionOrCommand::CodeAction(CodeAction {
+            title: format!("Add missing `{}` trait bound", missing_trait),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![diagnostic.clone()]),
+            edit: Some(WorkspaceEdit {
+                changes: Some(
+                    [(
+                        uri.clone(),
+                        vec![TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: diagnostic.range.start.line,
+                                    character: 0,
+                                },
+                                end: Position {
+                                    line: diagnostic.range.start.line,
+                                    character: line.len() as u32,
+                                },
+                            },
+                            new_text: new_signature.to_string(),
+                        }],
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            }),
+            is_preferred: Some(true),
+            ..Default::default()
+        }))
+    }
+
+    /// Fix StateStore set without TTL by adding a default TTL.
+    fn fix_statestore_ttl(
+        &self,
+        content: &str,
+        uri: &Url,
+        diagnostic: &Diagnostic,
+    ) -> Option<CodeActionOrCommand> {
+        // Extract fix data from diagnostic
+        let fix_data = diagnostic.data.as_ref()?;
+        let fixed_line = fix_data.get("fixed_line")?.as_str()?;
+
+        let line = content.lines().nth(diagnostic.range.start.line as usize)?;
+
+        Some(CodeActionOrCommand::CodeAction(CodeAction {
+            title: "Add TTL of 1 hour".to_string(),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![diagnostic.clone()]),
+            edit: Some(WorkspaceEdit {
+                changes: Some(
+                    [(
+                        uri.clone(),
+                        vec![TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: diagnostic.range.start.line,
+                                    character: 0,
+                                },
+                                end: Position {
+                                    line: diagnostic.range.start.line,
+                                    character: line.len() as u32,
+                                },
+                            },
+                            new_text: fixed_line.to_string(),
+                        }],
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            }),
+            is_preferred: Some(true),
+            ..Default::default()
+        }))
+    }
+
+    /// Fix unused provider bound in helper function.
+    fn fix_unused_fn_bound(
+        &self,
+        content: &str,
+        uri: &Url,
+        diagnostic: &Diagnostic,
+    ) -> Option<CodeActionOrCommand> {
+        // Similar to handler fix but for standalone functions
+        let fix_data = diagnostic.data.as_ref()?;
+        let new_signature = fix_data.get("new_fn_signature")?.as_str()?;
+        let unused_trait = fix_data.get("unused_trait")?.as_str()?;
+
+        let line = content.lines().nth(diagnostic.range.start.line as usize)?;
+
+        Some(CodeActionOrCommand::CodeAction(CodeAction {
+            title: format!("Remove unused `{}` trait bound", unused_trait),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![diagnostic.clone()]),
+            edit: Some(WorkspaceEdit {
+                changes: Some(
+                    [(
+                        uri.clone(),
+                        vec![TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: diagnostic.range.start.line,
+                                    character: 0,
+                                },
+                                end: Position {
+                                    line: diagnostic.range.start.line,
+                                    character: line.len() as u32,
+                                },
+                            },
+                            new_text: new_signature.to_string(),
+                        }],
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            }),
+            is_preferred: Some(true),
+            ..Default::default()
+        }))
+    }
+
+    /// Fix missing provider bound in helper function.
+    fn fix_missing_fn_bound(
+        &self,
+        content: &str,
+        uri: &Url,
+        diagnostic: &Diagnostic,
+    ) -> Option<CodeActionOrCommand> {
+        let fix_data = diagnostic.data.as_ref()?;
+        let new_signature = fix_data.get("new_fn_signature")?.as_str()?;
+        let missing_trait = fix_data.get("missing_trait")?.as_str()?;
+
+        let line = content.lines().nth(diagnostic.range.start.line as usize)?;
+
+        Some(CodeActionOrCommand::CodeAction(CodeAction {
+            title: format!("Add missing `{}` trait bound", missing_trait),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![diagnostic.clone()]),
+            edit: Some(WorkspaceEdit {
+                changes: Some(
+                    [(
+                        uri.clone(),
+                        vec![TextEdit {
+                            range: Range {
+                                start: Position {
+                                    line: diagnostic.range.start.line,
+                                    character: 0,
+                                },
+                                end: Position {
+                                    line: diagnostic.range.start.line,
+                                    character: line.len() as u32,
+                                },
+                            },
+                            new_text: new_signature.to_string(),
+                        }],
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                ..Default::default()
+            }),
+            is_preferred: Some(true),
             ..Default::default()
         }))
     }
