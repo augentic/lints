@@ -1,202 +1,285 @@
-# QWASR LSP Server
+# QWASR Lint
 
-A QWASR-aware Language Server Protocol (LSP) implementation for Rust, providing intelligent assistance for developing WASM components using the [QWASR](https://github.com/augentic/qwasr) (Quick WebAssembly Secure Runtime) platform.
+A custom Rust linter for QWASR WASM32 handler development. This linter enforces best practices, detects forbidden patterns, and validates Handler implementations for WASM32 targets.
 
 ## Features
 
-### Diagnostics
-
-The LSP provides real-time diagnostics for common QWASR issues:
-
-- **Forbidden Crates**: Detects usage of crates incompatible with WASM32 (e.g., `reqwest`, `tokio`, `redis`)
-- **Forbidden Patterns**: Identifies patterns that violate WASM32 constraints:
-  - Global mutable state (`static mut`, `OnceCell`, `lazy_static!`)
-  - OS-specific APIs (`std::fs`, `std::net`, `std::thread`, `std::env`)
-  - Blocking operations (`thread::sleep`)
-- **Handler Issues**: Checks Handler trait implementations for common mistakes
-- **Best Practices**: Warns about `unwrap()`/`expect()` usage and `println!` in WASM code
-
-### Semantic Analysis
-
-Deep code analysis beyond pattern matching:
-
-- **Provider Trait Bounds**: Detects unused or missing trait bounds on Handler implementations
-- **Trait Usage Tracking**: Identifies which provider traits are actually used vs. declared
-- **Handler Validation**: Validates Handler impl structure and associated types
-
-### Completions
-
-Context-aware completions for QWASR patterns:
-
-- Provider trait methods (`Config::get`, `HttpRequest::fetch`, etc.)
-- Error macros (`bad_request!`, `server_error!`, `bad_gateway!`)
-- Import suggestions for `qwasr_sdk` types
-- Code snippets for common patterns:
-  - Handler implementation boilerplate
-  - Request/Response struct definitions
-  - HTTP fetch patterns
-  - Cache operations with StateStore
-
-### Hover Documentation
-
-Rich documentation on hover for QWASR concepts:
-
-- **Provider Traits**: `Config`, `HttpRequest`, `Publisher`, `StateStore`, `Identity`, `TableStore`
-- **Handler Trait**: Definition, associated types, and methods
-- **Error Macros**: Usage examples and HTTP status mappings
-- **SDK Types**: `Context`, `Reply`, `Message`
-
-### Code Actions
-
-Quick fixes and refactoring suggestions:
-
-- Replace `std::env::var()` with `Config::get()`
-- Replace `SystemTime` with `chrono::Utc::now()`
-- Replace `println!` with `tracing::info!`
-- Replace `.unwrap()` with `?` operator
-- Remove forbidden crate imports
-
-### Document Symbols
-
-Navigate QWASR code with symbol outlines:
-
-- Handler implementations
-- Request/Response structs
-- Provider trait implementations
-- Async handler functions
+- **80+ Validation Rules** across 13 categories
+- **Semantic Analysis** for provider trait bound checking
+- **Multiple Output Formats**: Pretty, JSON, Compact, GitHub Actions
+- **Parallel Processing** for fast linting of large codebases
+- **Configurable Severity Levels**
+- **Rule Category Filtering**
+- **Inline Ignore Directives** using `#[qwasr::allow(...)]` attributes
 
 ## Installation
 
-You must build the LSP server from source. Pre-built binaries are not currently distributed.
-
-### Building from Source
-
-**Prerequisites:**
-- Rust 1.70+
-- Cargo
+### From Source
 
 ```bash
-cd lsp
-cargo build --release
+cd custom-linter
+cargo install --path .
 ```
 
-The compiled binary will be available at `target/release/qwasr-lsp`.
+### As a Dependency
 
-### VS Code Extension
+Add to your `Cargo.toml`:
 
-**Using the Pre-built VSIX File**
-
-1. Build the LSP server as described above
-2. Install the VS Code extension from the `.vsix` file:
-   ```bash
-   code --install-extension qwasr-lsp-extension.vsix
-   ```
-   Or manually:
-   - Open VS Code
-   - Go to Extensions (Cmd+Shift+X)
-   - Click "Install from VSIX..."
-   - Select the `qwasr-lsp-extension.vsix` file
-
-3. The extension will automatically use the `qwasr-lsp` binary from your `target/release` directory
-
-
-### Claude Code Integration
-
-> **TODO**: Integration with Claude Code skill for LLM-assisted QWASR development. The `llm` module is already designed to work with Claude Code for structured analysis output.
+```toml
+[dev-dependencies]
+qwasr-lint = { path = "../custom-linter" }
+```
 
 ## Usage
 
-The LSP server communicates over stdin/stdout using the Language Server Protocol.
-
-### Environment Variables
-
-- `RUST_LOG`: Set logging level (e.g., `RUST_LOG=debug`)
-
-## Project Structure
-
-```
-lsp/
-├── src/
-│   ├── main.rs                 # Entry point and LSP server initialization
-│   ├── backend.rs              # LSP backend implementation and message routing
-│   ├── capabilities.rs         # Server capabilities definition
-│   ├── diagnostics.rs          # Diagnostics engine for QWASR issue detection
-│   ├── llm.rs                  # LLM-oriented analysis module for Claude Code integration
-│   ├── semantic.rs             # Semantic analysis utilities
-│   ├── lib.rs                  # Library exports
-│   ├── handlers/               # LSP feature handlers
-│   │   ├── mod.rs
-│   │   ├── completion.rs       # Completion provider implementation
-│   │   ├── hover.rs            # Hover documentation provider
-│   │   ├── code_action.rs      # Quick fixes and refactoring suggestions
-│   │   └── document_symbol.rs  # Document symbol/outline provider
-│   └── qwasr/                  # QWASR domain knowledge
-│       ├── mod.rs
-│       ├── traits.rs           # Provider trait definitions and documentation
-│       ├── constraints.rs      # Forbidden patterns and crates database
-│       ├── patterns.rs         # Code snippets and templates for common patterns
-│       ├── rules.rs            # 50+ comprehensive validation rules
-│       └── rules/              # Detailed rule implementations
-├── examples/
-│   └── semantic_tests.rs       # Example semantic analysis tests
-├── Cargo.toml                  # Rust dependencies and project metadata
-├── QWASR_RULES_REFERENCE.md   # Detailed reference for all validation rules
-└── README.md
-```
-
-### Key Modules
-
-- **Backend**: Core LSP message handling and dispatch
-- **Diagnostics**: Real-time issue detection for WASM32 and QWASR patterns
-- **Handlers**: Implements LSP features (completion, hover, code actions, etc.)
-- **QWASR Knowledge Base**: Domain-specific rules, patterns, and validation logic
-- **LLM Module**: Structured analysis output for AI-assisted development
-
-## Development
-
-### Running Tests
+### Command Line
 
 ```bash
-cargo test
+# Lint a single file
+qwasr-lint src/handler.rs
+
+# Lint a directory recursively
+qwasr-lint src/
+
+# Lint multiple paths
+qwasr-lint src/ tests/
+
+# Output as JSON
+qwasr-lint src/ --format json
+
+# Only show errors and warnings
+qwasr-lint src/ --severity warning
+
+# Filter by category
+qwasr-lint src/ --categories handler,wasm,error
+
+# Disable specific rules
+qwasr-lint src/ --disable error_generic_unwrap,println_debug
+
+# GitHub Actions output
+qwasr-lint src/ --format github
+
+# Show statistics
+qwasr-lint src/ --stats
 ```
 
-### Debugging
+### As a Library
 
-Set the log level for verbose output:
+```rust
+use qwasr_lint::{Linter, LintConfig, RuleSeverity};
+
+fn main() {
+    let config = LintConfig {
+        min_severity: RuleSeverity::Warning,
+        show_fixes: true,
+        ..Default::default()
+    };
+
+    let linter = Linter::new(config);
+    
+    let diagnostics = linter.lint_file("src/handler.rs").unwrap();
+    
+    for diag in diagnostics {
+        println!("{}", diag);
+    }
+}
+```
+
+## Rule Categories
+
+| Category | Description | Count |
+|----------|-------------|-------|
+| **Handler** | Handler trait implementation rules | 8 |
+| **Provider** | Provider trait usage rules | 11 |
+| **Error** | Error handling rules | 19 |
+| **Wasm** | WASM32 compatibility rules | 12 |
+| **Stateless** | Statelessness enforcement | 6 |
+| **Performance** | Performance optimization hints | 5 |
+| **Security** | Security-critical rules | 2 |
+| **StrongTyping** | Type safety recommendations | 3 |
+| **Time** | Time handling rules | 2 |
+| **Auth** | Authentication rules | 2 |
+| **Caching** | Cache usage rules | 2 |
+
+## Key Rules
+
+### Critical Errors (Must Fix)
+
+| Rule ID | Description |
+|---------|-------------|
+| `error_panic_macro` | No `panic!` in WASM handlers |
+| `error_unreachable` | No `unreachable!` macro |
+| `error_assert` | No `assert!` in handlers |
+| `wasm_std_fs` | No `std::fs` access |
+| `wasm_std_net` | No `std::net` access |
+| `wasm_std_thread` | No `std::thread` usage |
+| `stateless_static_mut` | No `static mut` state |
+| `security_sql_concat` | No SQL string concatenation |
+| `forbidden_tokio` | No Tokio runtime |
+
+### Warnings (Should Fix)
+
+| Rule ID | Description |
+|---------|-------------|
+| `error_generic_unwrap` | Avoid `.unwrap()` and `.expect()` |
+| `handler_context_lifetime` | Use `Context<'_, P>` lifetime |
+| `provider_bounds_minimal` | Declare only used provider traits |
+| `cache_missing_ttl` | StateStore::set should have TTL |
+
+### Semantic Analysis
+
+The linter performs deep semantic analysis to detect:
+
+- **Unused Provider Bounds**: Traits declared but never used
+- **Missing Provider Bounds**: Traits used but not declared
+- **StateStore TTL Issues**: Cache operations without expiration
+
+## Forbidden Crates
+
+The following crates are not compatible with WASM32:
+
+| Category | Crates |
+|----------|--------|
+| HTTP Clients | `reqwest`, `hyper`, `surf`, `ureq` |
+| Async Runtimes | `tokio`, `async-std`, `smol` |
+| Databases | `sqlx`, `diesel`, `postgres`, `mysql` |
+| Parallelism | `rayon`, `crossbeam` |
+| Global State | `once_cell`, `lazy_static` |
+| Messaging | `rdkafka`, `lapin` |
+
+## Output Formats
+
+### Pretty (Default)
+
+Human-readable colored output with source snippets and fix suggestions.
+
+### JSON
+
+Structured output for tooling integration:
+
+```json
+[
+  {
+    "file": "src/handler.rs",
+    "line": 10,
+    "column": 5,
+    "severity": "error",
+    "rule_id": "error_panic_macro",
+    "message": "Never use panic! in WASM handlers",
+    "fix": "Return Err(server_error!(\"reason\")) instead"
+  }
+]
+```
+
+### Compact
+
+One diagnostic per line:
+
+```
+src/handler.rs:10:5: E [error_panic_macro] Never use panic! in WASM handlers
+```
+
+### GitHub Actions
+
+Native GitHub Actions annotation format for CI integration.
+
+## CI Integration
+
+### GitHub Actions
+
+```yaml
+- name: Run QWASR Lint
+  run: |
+    cargo install --path custom-linter
+    qwasr-lint src/ --format github --error-on-warnings
+```
+
+### Pre-commit Hook
 
 ```bash
-RUST_LOG=debug cargo run
+#!/bin/bash
+qwasr-lint src/ --severity warning --quiet
+if [ $? -ne 0 ]; then
+    echo "Linting failed. Please fix the issues above."
+    exit 1
+fi
 ```
 
-Or when using the compiled binary directly:
+## Configuration
 
-```bash
-RUST_LOG=debug ./target/release/qwasr-lsp
+### Inline Ignore Directives
+
+You can suppress specific lint warnings using `#[qwasr::allow(...)]` attributes, similar to Clippy's `#[allow(...)]`.
+
+#### Ignore all rules for the next item
+
+```rust
+#[qwasr::allow(all)]
+fn my_function() {
+    let x = Some(5).unwrap();  // No warning
+}
 ```
 
-## References
+#### Ignore specific rule(s)
 
-### QWASR Ecosystem
+```rust
+#[qwasr::allow(unwrap_used)]
+fn my_function() {
+    let x = Some(5).unwrap();  // No warning for unwrap_used
+}
 
-- [QWASR Repository](https://github.com/augentic/qwasr) - Quick WebAssembly Secure Runtime platform
-- [QWASR SDK](https://github.com/augentic/qwasr-sdk) - Rust SDK for QWASR component development
-- [QWASR Rules Reference](./QWASR_RULES_REFERENCE.md) - Comprehensive validation rules documentation
+// Multiple rules can be specified
+#[qwasr::allow(unwrap_used, expect_used)]
+fn my_function() {
+    let x = Some(5).unwrap();
+    let y = Some(6).expect("msg");  // Both ignored
+}
+```
 
-### Standards and Specifications
+#### File-level ignore (inner attribute)
 
-- [Language Server Protocol (LSP)](https://microsoft.github.io/language-server-protocol/) - Official LSP specification
-- [WebAssembly (WASM)](https://webassembly.org/) - WebAssembly documentation
-- [WASI](https://wasi.dev/) - WebAssembly System Interface
+Use `#!` for file-wide suppression:
 
-### Rust Libraries
+```rust
+#![qwasr::allow(all)]  // Ignore all rules in this file
 
-- [tower-lsp](https://github.com/ebkalderon/tower-lsp) - Async LSP server framework
-- [tower](https://github.com/tower-rs/tower) - Modular and reusable components for building robust clients and servers
-- [tokio](https://tokio.rs/) - Async runtime for Rust
-- [serde](https://serde.rs/) - Serialization/deserialization framework
+fn my_function() {
+    let x = Some(5).unwrap();  // No warning
+}
+```
 
-### Related Tools
+```rust
+#![qwasr::allow(forbidden_crate_tokio)]  // Only ignore tokio warnings file-wide
 
-- [rust-analyzer](https://rust-analyzer.github.io/) - Official Rust language server (inspiration)
-- [Clippy](https://github.com/rust-lang/rust-clippy) - Official Rust linter (rule patterns)
+use tokio::runtime::Runtime;  // No warning
+```
 
+### LintConfig Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `all_rules` | bool | true | Enable all rules |
+| `categories` | Vec | [] | Filter by categories |
+| `disabled_rules` | Vec | [] | Rules to disable |
+| `min_severity` | Severity | Hint | Minimum severity to report |
+| `show_fixes` | bool | true | Show fix suggestions |
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | No errors (warnings may be present) |
+| 1 | One or more errors found |
+| 1 | Warnings found (with `--error-on-warnings`) |
+
+## Contributing
+
+1. Add new rules in `src/rules.rs`
+2. Add forbidden patterns in `src/constraints.rs`
+3. Extend semantic analysis in `src/semantic.rs`
+4. Run tests: `cargo test`
+5. Build: `cargo build --release`
+
+## License
+
+MIT

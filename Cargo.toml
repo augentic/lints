@@ -1,59 +1,48 @@
 [package]
-name = "qwasr-lsp"
+name = "qwasr-lint"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
-description = "A QWASR-aware Language Server Protocol implementation for Rust"
-authors = ["Matthew Kurian"]
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/augentic/qwasr-lsp"
-keywords = ["lsp", "language-server", "qwasr", "wasm", "rust"]
-categories = ["development-tools", "text-editors"]
-
-[dependencies]
-# LSP protocol and server infrastructure
-tower-lsp = "0.20"
-tokio = { version = "1", features = ["full"] }
-
-# Rust parsing and analysis
-syn = { version = "2", features = ["full", "parsing", "visit", "extra-traits"] }
-quote = "1"
-proc-macro2 = { version = "1", features = ["span-locations"] }
-
-# Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# Error handling
-anyhow = "1"
-thiserror = "1"
-
-# Logging and tracing
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# File watching and async utilities
-notify = "8"
-dashmap = "6"
-futures = "0.3"
-
-# Regex for pattern matching
-regex = "1"
-
-# Path utilities
-walkdir = "2"
-
-[dev-dependencies]
-tokio-test = "0.4"
-tempfile = "3"
-
-[lib]
-name = "qwasr_lsp"
-path = "src/lib.rs"
+description = "A custom Rust linter for QWASR WASM32 handler development"
+authors = ["Augentic Team"]
+license = "MIT"
+readme = "README.md"
+keywords = ["linter", "wasm", "qwasr", "rust-analyzer"]
+categories = ["development-tools", "wasm"]
 
 [[bin]]
-name = "qwasr-lsp"
+name = "qwasr-lint"
 path = "src/main.rs"
+
+[lib]
+name = "qwasr_lint"
+path = "src/lib.rs"
+
+[dependencies]
+# CLI argument parsing
+clap = { version = "4.4", features = ["derive"] }
+
+# Regex for pattern matching
+regex = "1.10"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0.18"
+
+# File walking
+walkdir = "2.4"
+
+# Colored terminal output
+colored = "3.1.1"
+
+# Parallel processing
+rayon = "1.8"
+
+[dev-dependencies]
+tempfile = "3.10"
 
 [profile.release]
 lto = true

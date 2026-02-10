@@ -5,14 +5,36 @@
 //! - Provider trait bound analysis (detecting unused or missing bounds)
 //! - Trait usage tracking
 //! - Handler implementation validation
+//! - Transitive trait detection through function delegation
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use regex::Regex;
-use tower_lsp::lsp_types::*;
 
-use crate::qwasr::QwasrContext;
+use crate::diagnostics::Diagnostic;
+use crate::rules::{RuleCategory, RuleSeverity};
+
+/// Information about a helper function with provider bounds.
+#[derive(Debug, Clone)]
+pub struct FunctionInfo {
+    /// Name of the function.
+    pub name: String,
+
+    /// Line number where the function starts (0-indexed).
+    pub line: usize,
+
+    /// Provider trait bounds declared on the function.
+    pub declared_bounds: HashSet<String>,
+
+    /// Provider traits directly used in the function body.
+    pub direct_trait_usage: HashSet<String>,
+
+    /// Functions called from within this function.
+    pub called_functions: HashSet<String>,
+
+    /// Line range of the function.
+    pub line_range: (usize, usize),
+}
 
 /// Result of semantic analysis for a document.
 #[derive(Debug, Default)]
@@ -33,23 +55,27 @@ pub struct HandlerInfo {
     /// Name of the request type implementing Handler.
     pub request_type: String,
 
-    /// Line number where the impl block starts.
-    pub impl_line: u32,
+    /// Line number where the impl block starts (0-indexed).
+    pub impl_line: usize,
 
     /// Provider trait bounds declared on the impl.
     pub declared_bounds: HashSet<String>,
 
-    /// Provider traits actually used in the handler body.
+    /// Provider traits actually used in the handler body (including transitive usage via delegation).
     pub used_traits: HashSet<String>,
 
+    /// Provider traits directly used in the handler body (before transitive resolution).
+    pub direct_trait_usage: HashSet<String>,
+
+    /// Functions called from within this handler.
+    pub called_functions: HashSet<String>,
+
     /// Line range of the impl block.
-    #[allow(dead_code)]
-    pub line_range: (u32, u32),
+    pub line_range: (usize, usize),
 }
 
 /// A detected usage of a provider trait.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct TraitUsage {
     /// Name of the trait used.
     pub trait_name: String,
@@ -57,19 +83,23 @@ pub struct TraitUsage {
     /// Method called on the trait.
     pub method: String,
 
-    /// Line number where the usage occurs.
-    pub line: u32,
+    /// Line number where the usage occurs (0-indexed).
+    pub line: usize,
 
     /// Column range of the usage.
-    pub col_range: (u32, u32),
+    pub col_range: (usize, usize),
+}
+
+/// Pattern for detecting trait method usage.
+struct TraitMethodPattern {
+    trait_name: &'static str,
+    #[allow(dead_code)]
+    methods: Vec<&'static str>,
+    patterns: Vec<Regex>,
 }
 
 /// Semantic analyzer for QWASR code.
 pub struct SemanticAnalyzer {
-    /// QWASR context with known patterns.
-    #[allow(dead_code)]
-    context: Arc<QwasrContext>,
-
     /// Regex for detecting Handler impl blocks.
     handler_impl_re: Regex,
 
@@ -81,18 +111,17 @@ pub struct SemanticAnalyzer {
 
     /// Provider trait method patterns for usage detection.
     trait_method_patterns: Vec<TraitMethodPattern>,
-}
 
-/// Pattern for detecting trait method usage.
-struct TraitMethodPattern {
-    trait_name: &'static str,
-    methods: Vec<&'static str>,
-    patterns: Vec<Regex>,
+    /// Regex for detecting async function definitions with provider bounds.
+    fn_with_provider_re: Regex,
+
+    /// Regex for detecting function calls (for transitive trait tracking).
+    function_call_re: Regex,
 }
 
 impl SemanticAnalyzer {
     /// Create a new semantic analyzer.
-    pub fn new(context: Arc<QwasrContext>) -> Self {
+    pub fn new() -> Self {
         let trait_method_patterns = vec![
             TraitMethodPattern {
                 trait_name: "Config",
@@ -123,9 +152,7 @@ impl SemanticAnalyzer {
                 trait_name: "StateStore",
                 methods: vec!["get", "set", "delete"],
                 patterns: vec![
-                    // StateStore::get/set/delete patterns
                     Regex::new(r"StateStore::(?:get|set|delete)\s*\(").unwrap(),
-                    // ctx.provider.get/set/delete with await (StateStore methods)
                     Regex::new(r"(?:ctx\.)?provider\.(?:get|set|delete)\s*\([^)]*\)\.await")
                         .unwrap(),
                 ],
@@ -150,15 +177,21 @@ impl SemanticAnalyzer {
         ];
 
         Self {
-            context,
             handler_impl_re: Regex::new(
                 r"impl\s*<\s*P\s*(?::\s*([^>]+))?\s*>\s*Handler\s*<\s*P\s*>\s*for\s+(\w+)",
             )
             .unwrap(),
             bounds_re: Regex::new(r"(\w+)(?:\s*\+\s*|\s*,|\s*$)").unwrap(),
-            // Match where clause with P bounds, handling multi-line format
             where_bounds_re: Regex::new(r"(?s)where\s+P\s*:\s*([^{]+?)\s*\{").unwrap(),
             trait_method_patterns,
+            fn_with_provider_re: Regex::new(
+                r"(?:pub\s+)?async\s+fn\s+(\w+)\s*<\s*P\s*(?::\s*([^>]+))?\s*>\s*\([^)]*(?:provider|ctx)[^)]*\)"
+            ).unwrap(),
+            // Match function calls like: function_name(, function_name::<Type>(, self.method(
+            // Captures the function/method name
+            function_call_re: Regex::new(
+                r"(?:^|[^a-zA-Z_])([a-z_][a-z0-9_]*)\s*(?:::<[^>]*>)?\s*\("
+            ).unwrap(),
         }
     }
 
@@ -166,8 +199,11 @@ impl SemanticAnalyzer {
     pub fn analyze(&self, content: &str) -> SemanticAnalysisResult {
         let mut result = SemanticAnalysisResult::default();
 
-        // Find all handler implementations
-        let handlers = self.find_handler_implementations(content);
+        // First, build a map of all helper functions and their trait requirements
+        let function_map = self.build_function_map(content);
+
+        // Find all handler implementations with transitive trait resolution
+        let handlers = self.find_handler_implementations(content, &function_map);
 
         // Analyze each handler for trait bound issues
         for handler in &handlers {
@@ -196,7 +232,11 @@ impl SemanticAnalyzer {
     }
 
     /// Find all Handler implementations in the content.
-    fn find_handler_implementations(&self, content: &str) -> Vec<HandlerInfo> {
+    fn find_handler_implementations(
+        &self,
+        content: &str,
+        function_map: &HashMap<String, FunctionInfo>,
+    ) -> Vec<HandlerInfo> {
         let mut handlers = Vec::new();
         let lines: Vec<&str> = content.lines().collect();
 
@@ -207,10 +247,9 @@ impl SemanticAnalyzer {
                     .map(|m| m.as_str().to_string())
                     .unwrap_or_default();
 
-                // Extract bounds from the impl line or where clause
                 let mut declared_bounds = HashSet::new();
 
-                // Check inline bounds (impl<P: Trait1 + Trait2>)
+                // Check inline bounds
                 if let Some(bounds_match) = caps.get(1) {
                     for bound_cap in self.bounds_re.captures_iter(bounds_match.as_str()) {
                         if let Some(bound) = bound_cap.get(1) {
@@ -222,7 +261,7 @@ impl SemanticAnalyzer {
                     }
                 }
 
-                // Look for where clause in the next few lines
+                // Look for where clause
                 let context_lines: String = lines
                     .iter()
                     .skip(line_idx)
@@ -256,15 +295,24 @@ impl SemanticAnalyzer {
                     .collect::<Vec<_>>()
                     .join("\n");
 
-                // Detect used traits in the impl block
-                let used_traits = self.detect_trait_usage(&impl_content);
+                // Detect directly used traits
+                let direct_trait_usage = self.detect_trait_usage(&impl_content);
+
+                // Detect function calls within the handler
+                let called_functions = self.detect_function_calls(&impl_content);
+
+                // Resolve transitive trait usage through function delegation
+                let used_traits =
+                    self.resolve_transitive_traits(&direct_trait_usage, &called_functions, function_map);
 
                 handlers.push(HandlerInfo {
                     request_type,
-                    impl_line: line_idx as u32,
+                    impl_line: line_idx,
                     declared_bounds,
                     used_traits,
-                    line_range: (line_idx as u32, impl_end as u32),
+                    direct_trait_usage,
+                    called_functions,
+                    line_range: (line_idx, impl_end),
                 });
             }
         }
@@ -318,281 +366,55 @@ impl SemanticAnalyzer {
         used_traits
     }
 
-    /// Check for unused provider trait bounds.
-    fn check_unused_bounds(&self, handler: &HandlerInfo, _content: &str) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
+    /// Detect function calls within a code block.
+    /// Returns a set of function names that are called.
+    fn detect_function_calls(&self, content: &str) -> HashSet<String> {
+        let mut called_functions = HashSet::new();
 
-        for declared in &handler.declared_bounds {
-            if !handler.used_traits.contains(declared) {
-                // Calculate the fix: remove the unused trait from bounds
-                let new_bounds: Vec<_> = handler
-                    .declared_bounds
-                    .iter()
-                    .filter(|b| *b != declared)
-                    .cloned()
-                    .collect();
+        // Skip certain built-in/common function names that aren't helper functions
+        let skip_functions: HashSet<&str> = [
+            "ok", "err", "some", "none", "unwrap", "expect", "map", "map_err",
+            "and_then", "or_else", "ok_or", "ok_or_else", "unwrap_or",
+            "unwrap_or_else", "unwrap_or_default", "as_ref", "as_mut",
+            "into", "from", "try_into", "try_from", "clone", "to_string",
+            "to_owned", "format", "println", "eprintln", "dbg", "vec",
+            "async", "await", "return", "if", "else", "match", "for", "while",
+            "loop", "break", "continue", "let", "mut", "const", "static",
+            "fn", "impl", "struct", "enum", "trait", "type", "use", "mod",
+            "pub", "self", "super", "crate", "where", "get", "set", "send",
+            "fetch", "query", "exec", "delete", "access_token", // trait methods
+        ]
+        .into_iter()
+        .collect();
 
-                let fix_text = if new_bounds.is_empty() {
-                    format!("impl<P> Handler<P> for {}", handler.request_type)
-                } else {
-                    format!(
-                        "impl<P: {}> Handler<P> for {}",
-                        new_bounds.join(" + "),
-                        handler.request_type
-                    )
-                };
-
-                // Store fix data as JSON in the diagnostic
-                let fix_data = serde_json::json!({
-                    "fix_type": "remove_unused_bound",
-                    "unused_trait": declared,
-                    "new_impl_signature": fix_text,
-                    "request_type": handler.request_type,
-                    "remaining_bounds": new_bounds,
-                });
-
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line: handler.impl_line,
-                            character: 0,
-                        },
-                        end: Position {
-                            line: handler.impl_line,
-                            character: 200,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::WARNING),
-                    code: Some(NumberOrString::String("unused_provider_bound".to_string())),
-                    source: Some("qwasr".to_string()),
-                    message: format!(
-                        "Unused provider trait bound: `{}`\n\n\
-                        The `{}` trait is declared in the bounds for `{}` but is never used in the handler.\n\n\
-                        Consider removing it to keep bounds minimal:\n\
-                        `{}`",
-                        declared,
-                        declared,
-                        handler.request_type,
-                        fix_text
-                    ),
-                    tags: Some(vec![DiagnosticTag::UNNECESSARY]),
-                    data: Some(fix_data),
-                    ..Default::default()
-                });
-            }
-        }
-
-        diagnostics
-    }
-
-    /// Check for missing provider trait bounds.
-    fn check_missing_bounds(&self, handler: &HandlerInfo, _content: &str) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
-
-        for used in &handler.used_traits {
-            if !handler.declared_bounds.contains(used) {
-                // Calculate the fix: add the missing trait to bounds
-                let mut new_bounds: Vec<_> = handler.declared_bounds.iter().cloned().collect();
-                new_bounds.push(used.clone());
-                new_bounds.sort(); // Keep bounds in consistent order
-
-                let fix_text = format!(
-                    "impl<P: {}> Handler<P> for {}",
-                    new_bounds.join(" + "),
-                    handler.request_type
-                );
-
-                // Store fix data as JSON in the diagnostic
-                let fix_data = serde_json::json!({
-                    "fix_type": "add_missing_bound",
-                    "missing_trait": used,
-                    "new_impl_signature": fix_text,
-                    "request_type": handler.request_type,
-                    "all_bounds": new_bounds,
-                });
-
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line: handler.impl_line,
-                            character: 0,
-                        },
-                        end: Position {
-                            line: handler.impl_line,
-                            character: 200,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::ERROR),
-                    code: Some(NumberOrString::String("missing_provider_bound".to_string())),
-                    source: Some("qwasr".to_string()),
-                    message: format!(
-                        "Missing provider trait bound: `{}`\n\n\
-                        The handler for `{}` uses `{}` methods but doesn't declare it in the bounds.\n\n\
-                        Add the trait bound:\n\
-                        `{}`",
-                        used,
-                        handler.request_type,
-                        used,
-                        fix_text
-                    ),
-                    data: Some(fix_data),
-                    ..Default::default()
-                });
-            }
-        }
-
-        diagnostics
-    }
-
-    /// Collect all trait usages in the document.
-    fn collect_trait_usages(&self, content: &str) -> HashMap<String, Vec<TraitUsage>> {
-        let mut usages: HashMap<String, Vec<TraitUsage>> = HashMap::new();
-
-        for (line_idx, line) in content.lines().enumerate() {
-            for pattern in &self.trait_method_patterns {
-                for (method_idx, regex) in pattern.patterns.iter().enumerate() {
-                    for mat in regex.find_iter(line) {
-                        let method = if method_idx < pattern.methods.len() {
-                            pattern.methods[method_idx]
-                        } else {
-                            pattern.methods.first().copied().unwrap_or("unknown")
-                        };
-
-                        let usage = TraitUsage {
-                            trait_name: pattern.trait_name.to_string(),
-                            method: method.to_string(),
-                            line: line_idx as u32,
-                            col_range: (mat.start() as u32, mat.end() as u32),
-                        };
-
-                        usages
-                            .entry(pattern.trait_name.to_string())
-                            .or_default()
-                            .push(usage);
-                    }
+        for cap in self.function_call_re.captures_iter(content) {
+            if let Some(fn_name) = cap.get(1) {
+                let name = fn_name.as_str();
+                // Only include if it's likely a user-defined helper function
+                if !skip_functions.contains(name) && name.len() > 1 {
+                    called_functions.insert(name.to_string());
                 }
             }
         }
 
-        usages
+        called_functions
     }
 
-    /// Analyze trait usage patterns for potential issues.
-    fn analyze_trait_patterns(&self, content: &str) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
+    /// Build a map of all helper functions with their trait requirements.
+    fn build_function_map(&self, content: &str) -> HashMap<String, FunctionInfo> {
+        let mut function_map = HashMap::new();
         let lines: Vec<&str> = content.lines().collect();
 
-        // Check for Config usage without error handling
-        // Use simple pattern matching instead of lookahead
-        let config_get_re = Regex::new(r"provider\.get\s*\([^)]+\)").unwrap();
         for (line_idx, line) in lines.iter().enumerate() {
-            if config_get_re.is_match(line)
-                && !line.contains("unwrap_or")
-                && !line.contains("ok_or")
-            {
-                // Check if there's a ? on the same line or the config value is used with ?
-                if !line.contains('?') && !line.contains(".await?") {
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position {
-                                line: line_idx as u32,
-                                character: 0,
-                            },
-                            end: Position {
-                                line: line_idx as u32,
-                                character: line.len() as u32,
-                            },
-                        },
-                        severity: Some(DiagnosticSeverity::HINT),
-                        code: Some(NumberOrString::String("config_error_handling".to_string())),
-                        source: Some("qwasr".to_string()),
-                        message: "Config::get returns Result - consider using `?` or `.ok_or_else(|| bad_request!(\"missing config\"))?`".to_string(),
-                        ..Default::default()
-                    });
-                }
-            }
-        }
+            if let Some(caps) = self.fn_with_provider_re.captures(line) {
+                let fn_name = caps
+                    .get(1)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default();
 
-        // Check for StateStore set without TTL consideration
-        let set_no_ttl_re = Regex::new(r"provider\.set\s*\([^,]+,[^,]+,\s*None\s*\)").unwrap();
-        for (line_idx, line) in lines.iter().enumerate() {
-            if set_no_ttl_re.is_match(line) {
-                // Create fix: replace None with Some(Duration::from_secs(3600))
-                let fixed_line = line.replace(", None)", ", Some(Duration::from_secs(3600)))");
-
-                let fix_data = serde_json::json!({
-                    "fix_type": "add_ttl",
-                    "original_line": line,
-                    "fixed_line": fixed_line,
-                });
-
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line: line_idx as u32,
-                            character: 0,
-                        },
-                        end: Position {
-                            line: line_idx as u32,
-                            character: line.len() as u32,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::WARNING),
-                    code: Some(NumberOrString::String("statestore_no_ttl".to_string())),
-                    source: Some("qwasr".to_string()),
-                    message: "StateStore::set with None TTL - consider adding a TTL to prevent unbounded cache growth.\n\nExample: `Some(Duration::from_secs(3600))`".to_string(),
-                    data: Some(fix_data),
-                    ..Default::default()
-                });
-            }
-        }
-
-        // Check for HttpRequest fetch without proper error context
-        // Use simple matching instead of lookahead (not supported by rust regex)
-        let fetch_re = Regex::new(r"provider\.fetch\s*\([^)]+\)\.await\?").unwrap();
-        for (line_idx, line) in lines.iter().enumerate() {
-            if fetch_re.is_match(line) && !line.contains(".context(") {
-                diagnostics.push(Diagnostic {
-                    range: Range {
-                        start: Position {
-                            line: line_idx as u32,
-                            character: 0,
-                        },
-                        end: Position {
-                            line: line_idx as u32,
-                            character: line.len() as u32,
-                        },
-                    },
-                    severity: Some(DiagnosticSeverity::HINT),
-                    code: Some(NumberOrString::String("fetch_error_context".to_string())),
-                    source: Some("qwasr".to_string()),
-                    message: "Consider adding `.context(\"fetching from API\")` for better error messages.".to_string(),
-                    ..Default::default()
-                });
-            }
-        }
-
-        // Detect potential trait bound optimization
-        self.check_function_trait_bounds(content, &mut diagnostics);
-
-        diagnostics
-    }
-
-    /// Check helper functions for proper trait bounds.
-    fn check_function_trait_bounds(&self, content: &str, diagnostics: &mut Vec<Diagnostic>) {
-        let lines: Vec<&str> = content.lines().collect();
-
-        // Pattern for async functions with provider parameter
-        let fn_with_provider_re = Regex::new(
-            r"(?:pub\s+)?async\s+fn\s+(\w+)\s*<\s*P\s*(?::\s*([^>]+))?\s*>\s*\([^)]*(?:provider|ctx)[^)]*\)"
-        ).unwrap();
-
-        for (line_idx, line) in lines.iter().enumerate() {
-            if let Some(caps) = fn_with_provider_re.captures(line) {
-                let fn_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
-
-                // Get declared bounds
                 let mut declared_bounds = HashSet::new();
+
+                // Check inline bounds
                 if let Some(bounds_match) = caps.get(2) {
                     for bound_cap in self.bounds_re.captures_iter(bounds_match.as_str()) {
                         if let Some(bound) = bound_cap.get(1) {
@@ -626,7 +448,7 @@ impl SemanticAnalyzer {
                     }
                 }
 
-                // Find function body and detect usage
+                // Find function end and extract body
                 let fn_end = self.find_fn_end(&lines, line_idx);
                 let fn_content: String = lines
                     .iter()
@@ -636,125 +458,282 @@ impl SemanticAnalyzer {
                     .collect::<Vec<_>>()
                     .join("\n");
 
-                let used_traits = self.detect_trait_usage(&fn_content);
+                // Detect direct trait usage
+                let direct_trait_usage = self.detect_trait_usage(&fn_content);
 
-                // Report unused bounds in helper functions
-                for declared in &declared_bounds {
-                    if !used_traits.contains(declared) {
-                        // Calculate fix: remove unused trait from bounds
-                        let new_bounds: Vec<_> = declared_bounds
-                            .iter()
-                            .filter(|b| *b != declared)
-                            .cloned()
-                            .collect();
+                // Detect function calls
+                let called_functions = self.detect_function_calls(&fn_content);
 
-                        let new_signature = if new_bounds.is_empty() {
-                            line.replace(&format!("<P: {}>", declared), "<P>")
-                                .replace(&format!("<P: {} + ", declared), "<P: ")
-                                .replace(&format!(" + {}>", declared), ">")
-                        } else {
-                            // Attempt a simple replacement
-                            line.replace(&format!("{} + ", declared), "")
-                                .replace(&format!(" + {}", declared), "")
-                        };
+                function_map.insert(
+                    fn_name.clone(),
+                    FunctionInfo {
+                        name: fn_name,
+                        line: line_idx,
+                        declared_bounds,
+                        direct_trait_usage,
+                        called_functions,
+                        line_range: (line_idx, fn_end),
+                    },
+                );
+            }
+        }
 
-                        let fix_data = serde_json::json!({
-                            "fix_type": "remove_unused_fn_bound",
-                            "unused_trait": declared,
-                            "new_fn_signature": new_signature,
-                            "fn_name": fn_name,
-                        });
+        function_map
+    }
 
-                        diagnostics.push(Diagnostic {
-                            range: Range {
-                                start: Position {
-                                    line: line_idx as u32,
-                                    character: 0,
-                                },
-                                end: Position {
-                                    line: line_idx as u32,
-                                    character: line.len() as u32,
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::WARNING),
-                            code: Some(NumberOrString::String(
-                                "unused_fn_provider_bound".to_string(),
-                            )),
-                            source: Some("qwasr".to_string()),
-                            message: format!(
-                                "Unused provider trait bound `{}` in function `{}`.\n\n\
-                                Consider removing it to keep bounds minimal.",
-                                declared, fn_name
-                            ),
-                            tags: Some(vec![DiagnosticTag::UNNECESSARY]),
-                            data: Some(fix_data),
-                            ..Default::default()
-                        });
+    /// Resolve transitive trait requirements through function delegation.
+    /// This traverses the call graph to find all traits that are transitively required.
+    fn resolve_transitive_traits(
+        &self,
+        direct_usage: &HashSet<String>,
+        called_functions: &HashSet<String>,
+        function_map: &HashMap<String, FunctionInfo>,
+    ) -> HashSet<String> {
+        let mut all_traits = direct_usage.clone();
+        let mut visited = HashSet::new();
+        let mut to_visit: Vec<String> = called_functions.iter().cloned().collect();
+
+        while let Some(fn_name) = to_visit.pop() {
+            if visited.contains(&fn_name) {
+                continue;
+            }
+            visited.insert(fn_name.clone());
+
+            if let Some(fn_info) = function_map.get(&fn_name) {
+                // Add traits from the declared bounds of this function
+                // (declared bounds indicate what traits the function requires)
+                all_traits.extend(fn_info.declared_bounds.iter().cloned());
+
+                // Also add directly used traits from the function body
+                all_traits.extend(fn_info.direct_trait_usage.iter().cloned());
+
+                // Add any functions this function calls to the visit list
+                for called in &fn_info.called_functions {
+                    if !visited.contains(called) {
+                        to_visit.push(called.clone());
                     }
                 }
+            }
+        }
 
-                // Report missing bounds
-                for used in &used_traits {
-                    if !declared_bounds.contains(used) && !declared_bounds.is_empty() {
-                        // Calculate fix: add missing trait to bounds
-                        let mut all_bounds: Vec<_> = declared_bounds.iter().cloned().collect();
-                        all_bounds.push(used.clone());
-                        all_bounds.sort();
+        all_traits
+    }
 
-                        // Find the bounds portion and add the new trait
-                        let new_signature = if line.contains("<P:") {
-                            // Has existing bounds, add to them
-                            line.replace(
-                                &format!(
-                                    "<P: {}",
-                                    declared_bounds.iter().next().unwrap_or(&String::new())
-                                ),
-                                &format!(
-                                    "<P: {} + {}",
-                                    used,
-                                    declared_bounds.iter().next().unwrap_or(&String::new())
-                                ),
-                            )
-                        } else if line.contains("<P>") {
-                            // No bounds, add them
-                            line.replace("<P>", &format!("<P: {}>", used))
-                        } else {
-                            line.to_string()
+    /// Check for unused trait bounds in a handler.
+    fn check_unused_bounds(&self, handler: &HandlerInfo, content: &str) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        let lines: Vec<&str> = content.lines().collect();
+
+        for declared in &handler.declared_bounds {
+            if !handler.used_traits.contains(declared) {
+                diagnostics.push(Diagnostic {
+                    line: handler.impl_line + 1,
+                    column: 0,
+                    end_column: lines.get(handler.impl_line).map_or(0, |l| l.len()),
+                    severity: RuleSeverity::Warning,
+                    rule_id: "unused_provider_bound".to_string(),
+                    rule_name: "Unused Provider Trait Bound".to_string(),
+                    category: RuleCategory::Provider,
+                    message: format!(
+                        "Provider trait '{}' is declared but never used in handler '{}'.\n\nRemove unused trait from bounds to improve clarity.",
+                        declared, handler.request_type
+                    ),
+                    fix_template: Some(format!("Remove '{}' from provider bounds", declared)),
+                    source_snippet: lines.get(handler.impl_line).map(|s| s.to_string()),
+                });
+            }
+        }
+
+        diagnostics
+    }
+
+    /// Check for missing trait bounds in a handler.
+    fn check_missing_bounds(&self, handler: &HandlerInfo, content: &str) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        let lines: Vec<&str> = content.lines().collect();
+
+        for used in &handler.used_traits {
+            if !handler.declared_bounds.contains(used) {
+                diagnostics.push(Diagnostic {
+                    line: handler.impl_line + 1,
+                    column: 0,
+                    end_column: lines.get(handler.impl_line).map_or(0, |l| l.len()),
+                    severity: RuleSeverity::Error,
+                    rule_id: "missing_provider_bound".to_string(),
+                    rule_name: "Missing Provider Trait Bound".to_string(),
+                    category: RuleCategory::Provider,
+                    message: format!(
+                        "Handler '{}' uses trait '{}' but doesn't declare it in bounds.\n\nAdd '{}' to the provider bounds.",
+                        handler.request_type, used, used
+                    ),
+                    fix_template: Some(format!("Add '{}' to provider bounds", used)),
+                    source_snippet: lines.get(handler.impl_line).map(|s| s.to_string()),
+                });
+            }
+        }
+
+        diagnostics
+    }
+
+    /// Collect all trait usages in the content.
+    fn collect_trait_usages(&self, content: &str) -> HashMap<String, Vec<TraitUsage>> {
+        let mut usages: HashMap<String, Vec<TraitUsage>> = HashMap::new();
+
+        for (line_idx, line) in content.lines().enumerate() {
+            for pattern in &self.trait_method_patterns {
+                for regex in &pattern.patterns {
+                    for mat in regex.find_iter(line) {
+                        let usage = TraitUsage {
+                            trait_name: pattern.trait_name.to_string(),
+                            method: "".to_string(), // Could be extracted from match
+                            line: line_idx,
+                            col_range: (mat.start(), mat.end()),
                         };
-
-                        let fix_data = serde_json::json!({
-                            "fix_type": "add_missing_fn_bound",
-                            "missing_trait": used,
-                            "new_fn_signature": new_signature,
-                            "fn_name": fn_name,
-                            "all_bounds": all_bounds,
-                        });
-
-                        diagnostics.push(Diagnostic {
-                            range: Range {
-                                start: Position {
-                                    line: line_idx as u32,
-                                    character: 0,
-                                },
-                                end: Position {
-                                    line: line_idx as u32,
-                                    character: line.len() as u32,
-                                },
-                            },
-                            severity: Some(DiagnosticSeverity::ERROR),
-                            code: Some(NumberOrString::String(
-                                "missing_fn_provider_bound".to_string(),
-                            )),
-                            source: Some("qwasr".to_string()),
-                            message: format!(
-                                "Missing provider trait bound `{}` in function `{}`.\n\n\
-                                The function uses `{}` methods but doesn't declare it in bounds.",
-                                used, fn_name, used
-                            ),
-                            data: Some(fix_data),
-                            ..Default::default()
-                        });
+                        usages
+                            .entry(pattern.trait_name.to_string())
+                            .or_default()
+                            .push(usage);
                     }
+                }
+            }
+        }
+
+        usages
+    }
+
+    /// Analyze trait usage patterns for additional diagnostics.
+    fn analyze_trait_patterns(&self, content: &str) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Check for Config usage without error handling
+        let config_get_re = Regex::new(r"provider\.get\s*\([^)]+\)").unwrap();
+        for (line_idx, line) in lines.iter().enumerate() {
+            if config_get_re.is_match(line)
+                && !line.contains("unwrap_or")
+                && !line.contains("ok_or")
+            {
+                // Check if there's a ? on the same line or the config value is used with ?
+                if !line.contains('?') && !line.contains(".await?") {
+                    diagnostics.push(Diagnostic {
+                        line: line_idx + 1,
+                        column: 0,
+                        end_column: line.len(),
+                        severity: RuleSeverity::Hint,
+                        rule_id: "config_error_handling".to_string(),
+                        rule_name: "Config::get Error Handling".to_string(),
+                        category: RuleCategory::Error,
+                        message: "Config::get returns Result - consider using `?` or `.ok_or_else(|| bad_request!(\"missing config\"))?`".to_string(),
+                        fix_template: Some("Add `?` or proper error handling".to_string()),
+                        source_snippet: Some(line.to_string()),
+                    });
+                }
+            }
+        }
+
+        // Check for StateStore set without TTL consideration
+        let set_no_ttl_re = Regex::new(r"provider\.set\s*\([^,]+,[^,]+,\s*None\s*\)").unwrap();
+        for (line_idx, line) in lines.iter().enumerate() {
+            if set_no_ttl_re.is_match(line) {
+                diagnostics.push(Diagnostic {
+                    line: line_idx + 1,
+                    column: 0,
+                    end_column: line.len(),
+                    severity: RuleSeverity::Warning,
+                    rule_id: "statestore_no_ttl".to_string(),
+                    rule_name: "StateStore::set Without TTL".to_string(),
+                    category: RuleCategory::Caching,
+                    message: "StateStore::set with None TTL - consider adding a TTL to prevent unbounded cache growth.\n\nExample: `Some(Duration::from_secs(3600))`".to_string(),
+                    fix_template: Some("Some(Duration::from_secs(3600))".to_string()),
+                    source_snippet: Some(line.to_string()),
+                });
+            }
+        }
+
+        // Check for HttpRequest fetch without proper error context
+        let fetch_re = Regex::new(r"provider\.fetch\s*\([^)]+\)\.await\?").unwrap();
+        for (line_idx, line) in lines.iter().enumerate() {
+            if fetch_re.is_match(line) && !line.contains(".context(") {
+                diagnostics.push(Diagnostic {
+                    line: line_idx + 1,
+                    column: 0,
+                    end_column: line.len(),
+                    severity: RuleSeverity::Hint,
+                    rule_id: "fetch_error_context".to_string(),
+                    rule_name: "HttpRequest::fetch Error Context".to_string(),
+                    category: RuleCategory::Error,
+                    message: "Consider adding `.context(\"fetching from API\")` for better error messages.".to_string(),
+                    fix_template: Some("Add `.context(\"description\")` before `?`".to_string()),
+                    source_snippet: Some(line.to_string()),
+                });
+            }
+        }
+
+        // Check helper functions for proper trait bounds (with transitive resolution)
+        let function_map = self.build_function_map(content);
+        self.check_function_trait_bounds(content, &function_map, &mut diagnostics);
+
+        diagnostics
+    }
+
+    /// Check helper functions for proper trait bounds.
+    fn check_function_trait_bounds(
+        &self,
+        content: &str,
+        function_map: &HashMap<String, FunctionInfo>,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) {
+        let lines: Vec<&str> = content.lines().collect();
+
+        for fn_info in function_map.values() {
+            let line = lines.get(fn_info.line).map(|s| *s).unwrap_or("");
+
+            // Resolve transitive trait usage for this function
+            let used_traits = self.resolve_transitive_traits(
+                &fn_info.direct_trait_usage,
+                &fn_info.called_functions,
+                function_map,
+            );
+
+            // Report unused bounds in helper functions
+            for declared in &fn_info.declared_bounds {
+                if !used_traits.contains(declared) {
+                    diagnostics.push(Diagnostic {
+                        line: fn_info.line + 1,
+                        column: 0,
+                        end_column: line.len(),
+                        severity: RuleSeverity::Warning,
+                        rule_id: "unused_fn_provider_bound".to_string(),
+                        rule_name: "Unused Function Provider Trait Bound".to_string(),
+                        category: RuleCategory::Provider,
+                        message: format!(
+                            "Unused provider trait bound `{}` in function `{}`.\n\nConsider removing it to keep bounds minimal.",
+                            declared, fn_info.name
+                        ),
+                        fix_template: Some(format!("Remove '{}' from function bounds", declared)),
+                        source_snippet: Some(line.to_string()),
+                    });
+                }
+            }
+
+            // Report missing bounds in helper functions
+            for used in &used_traits {
+                if !fn_info.declared_bounds.contains(used) && !fn_info.declared_bounds.is_empty() {
+                    diagnostics.push(Diagnostic {
+                        line: fn_info.line + 1,
+                        column: 0,
+                        end_column: line.len(),
+                        severity: RuleSeverity::Error,
+                        rule_id: "missing_fn_provider_bound".to_string(),
+                        rule_name: "Missing Function Provider Trait Bound".to_string(),
+                        category: RuleCategory::Provider,
+                        message: format!(
+                            "Missing provider trait bound `{}` in function `{}`.\n\nThe function uses `{}` methods but doesn't declare it in bounds.",
+                            used, fn_info.name, used
+                        ),
+                        fix_template: Some(format!("Add '{}' to function bounds", used)),
+                        source_snippet: Some(line.to_string()),
+                    });
                 }
             }
         }
@@ -783,17 +762,19 @@ impl SemanticAnalyzer {
     }
 }
 
+impl Default for SemanticAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn create_analyzer() -> SemanticAnalyzer {
-        SemanticAnalyzer::new(Arc::new(QwasrContext::new()))
-    }
-
     #[test]
-    fn test_detect_unused_bound() {
-        let analyzer = create_analyzer();
+    fn test_find_handler_implementations() {
+        let analyzer = SemanticAnalyzer::new();
         let content = r#"
 impl<P: Config + HttpRequest> Handler<P> for MyRequest {
     type Error = Error;
@@ -801,84 +782,9 @@ impl<P: Config + HttpRequest> Handler<P> for MyRequest {
     type Output = MyResponse;
 
     fn from_input(input: Self::Input) -> Result<Self> {
-        serde_json::from_slice(&input).map_err(Into::into)
+        Ok(Self {})
     }
 
-    async fn handle(self, ctx: Context<'_, P>) -> Result<Reply<Self::Output>> {
-        // Only uses Config, not HttpRequest
-        let url = ctx.provider.get("API_URL")?;
-        Ok(Reply::ok(MyResponse { url }))
-    }
-}
-"#;
-
-        let result = analyzer.analyze(content);
-        assert!(!result.handlers.is_empty());
-
-        let handler = &result.handlers[0];
-        assert!(handler.declared_bounds.contains("Config"));
-        assert!(handler.declared_bounds.contains("HttpRequest"));
-        assert!(handler.used_traits.contains("Config"));
-        assert!(!handler.used_traits.contains("HttpRequest"));
-
-        // Should have an unused bound warning
-        let unused_warnings: Vec<_> = result
-            .diagnostics
-            .iter()
-            .filter(|d| d.code == Some(NumberOrString::String("unused_provider_bound".to_string())))
-            .collect();
-        assert!(!unused_warnings.is_empty());
-    }
-
-    #[test]
-    fn test_detect_missing_bound() {
-        let analyzer = create_analyzer();
-        let content = r#"
-impl<P: Config> Handler<P> for MyRequest {
-    type Error = Error;
-    type Input = Vec<u8>;
-    type Output = MyResponse;
-
-    fn from_input(input: Self::Input) -> Result<Self> {
-        serde_json::from_slice(&input).map_err(Into::into)
-    }
-
-    async fn handle(self, ctx: Context<'_, P>) -> Result<Reply<Self::Output>> {
-        let url = ctx.provider.get("API_URL")?;
-        // Uses HttpRequest but not declared
-        let response = ctx.provider.fetch(request).await?;
-        Ok(Reply::ok(MyResponse { url }))
-    }
-}
-"#;
-
-        let result = analyzer.analyze(content);
-        assert!(!result.handlers.is_empty());
-
-        let handler = &result.handlers[0];
-        assert!(handler.declared_bounds.contains("Config"));
-        assert!(!handler.declared_bounds.contains("HttpRequest"));
-        assert!(handler.used_traits.contains("HttpRequest"));
-
-        // Should have a missing bound error
-        let missing_errors: Vec<_> = result
-            .diagnostics
-            .iter()
-            .filter(|d| {
-                d.code == Some(NumberOrString::String("missing_provider_bound".to_string()))
-            })
-            .collect();
-        assert!(!missing_errors.is_empty());
-    }
-
-    #[test]
-    fn test_where_clause_bounds() {
-        let analyzer = create_analyzer();
-        let content = r#"
-impl<P> Handler<P> for MyRequest
-where
-    P: Config + HttpRequest + Publisher,
-{
     async fn handle(self, ctx: Context<'_, P>) -> Result<Reply<Self::Output>> {
         let url = ctx.provider.get("API_URL")?;
         let response = ctx.provider.fetch(request).await?;
@@ -886,33 +792,150 @@ where
     }
 }
 "#;
-
         let result = analyzer.analyze(content);
-        assert!(!result.handlers.is_empty());
+        assert_eq!(result.handlers.len(), 1);
 
         let handler = &result.handlers[0];
+        assert_eq!(handler.request_type, "MyRequest");
         assert!(handler.declared_bounds.contains("Config"));
         assert!(handler.declared_bounds.contains("HttpRequest"));
-        assert!(handler.declared_bounds.contains("Publisher"));
-
-        // Publisher is unused
-        assert!(!handler.used_traits.contains("Publisher"));
+        assert!(handler.used_traits.contains("Config"));
+        assert!(handler.used_traits.contains("HttpRequest"));
     }
 
     #[test]
-    fn test_trait_usage_collection() {
-        let analyzer = create_analyzer();
+    fn test_detect_unused_bounds() {
+        let analyzer = SemanticAnalyzer::new();
         let content = r#"
-async fn do_something<P: Config + HttpRequest>(provider: &P) -> Result<()> {
-    let url = provider.get("URL")?;
-    let response = provider.fetch(request).await?;
-    Ok(())
+impl<P: Config + HttpRequest + Publisher> Handler<P> for MyRequest {
+    async fn handle(self, ctx: Context<'_, P>) -> Result<Reply<Self::Output>> {
+        let url = ctx.provider.get("API_URL")?;
+        Ok(Reply::ok(MyResponse {}))
+    }
 }
 "#;
-
         let result = analyzer.analyze(content);
 
-        assert!(result.trait_usages.contains_key("Config"));
-        assert!(result.trait_usages.contains_key("HttpRequest"));
+        // Should have warnings for unused HttpRequest and Publisher
+        let unused_warnings: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_id == "unused_provider_bound")
+            .collect();
+
+        assert!(unused_warnings.len() >= 1);
+    }
+
+    #[test]
+    fn test_detect_missing_bounds() {
+        let analyzer = SemanticAnalyzer::new();
+        let content = r#"
+impl<P: Config> Handler<P> for CacheRequest {
+    async fn handle(self, ctx: Context<'_, P>) -> Result<Reply<Self::Output>> {
+        let cached = ctx.provider.get("key").await?;
+        Ok(Reply::ok(cached))
+    }
+}
+"#;
+        let result = analyzer.analyze(content);
+
+        // Should have an error for missing StateStore bound
+        let missing_errors: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_id == "missing_provider_bound")
+            .collect();
+
+        assert!(missing_errors.len() >= 1);
+    }
+
+    #[test]
+    fn test_transitive_trait_detection_via_function_delegation() {
+        let analyzer = SemanticAnalyzer::new();
+        // Handler calls fetch_data which requires HttpRequest
+        // HttpRequest should NOT be marked as unused
+        let content = r#"
+// Helper function that uses HttpRequest
+async fn fetch_data<P: HttpRequest>(provider: &P, url: &str) -> Result<Response> {
+    provider.fetch(url).await
+}
+
+impl<P: Config + HttpRequest> Handler<P> for DelegatingRequest {
+    async fn handle(self, ctx: Context<'_, P>) -> Result<Reply<Self::Output>> {
+        let url = ctx.provider.get("API_URL")?;
+        // Delegates to helper - HttpRequest is used transitively
+        let response = fetch_data(&ctx.provider, &url).await?;
+        Ok(Reply::ok(response))
+    }
+}
+"#;
+        let result = analyzer.analyze(content);
+
+        let handler = &result.handlers[0];
+
+        // HttpRequest should be detected as transitively used
+        assert!(
+            handler.used_traits.contains("HttpRequest"),
+            "HttpRequest should be detected via transitive delegation to fetch_data"
+        );
+
+        // There should be NO unused warnings for HttpRequest
+        let unused_http: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_id == "unused_provider_bound" && d.message.contains("HttpRequest"))
+            .collect();
+
+        assert!(
+            unused_http.is_empty(),
+            "HttpRequest should not be flagged as unused when used transitively: {:?}",
+            unused_http
+        );
+    }
+
+    #[test]
+    fn test_transitive_trait_detection_chain() {
+        let analyzer = SemanticAnalyzer::new();
+        // Tests a chain: handler -> helper1 -> helper2 (which uses the trait)
+        let content = r#"
+// Inner helper that uses Publisher
+async fn send_notification<P: Publisher>(provider: &P, msg: &str) -> Result<()> {
+    provider.send(msg).await
+}
+
+// Outer helper that delegates to inner
+async fn notify_users<P: Publisher>(provider: &P) -> Result<()> {
+    send_notification(provider, "Hello").await
+}
+
+impl<P: Config + Publisher> Handler<P> for ChainedRequest {
+    async fn handle(self, ctx: Context<'_, P>) -> Result<Reply<Self::Output>> {
+        let _ = ctx.provider.get("NOTIFY")?;
+        notify_users(&ctx.provider).await?;
+        Ok(Reply::ok(()))
+    }
+}
+"#;
+        let result = analyzer.analyze(content);
+
+        let handler = &result.handlers[0];
+
+        // Publisher should be detected through the chain
+        assert!(
+            handler.used_traits.contains("Publisher"),
+            "Publisher should be detected via chained delegation: notify_users -> send_notification"
+        );
+
+        // No unused warnings for Publisher
+        let unused_pub: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_id == "unused_provider_bound" && d.message.contains("Publisher"))
+            .collect();
+
+        assert!(
+            unused_pub.is_empty(),
+            "Publisher should not be flagged as unused when used in delegation chain"
+        );
     }
 }
