@@ -8,6 +8,7 @@ use colored::Colorize;
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
+use qwasr_lint::config;
 use qwasr_lint::output::{format_diagnostics, OutputFormat};
 use qwasr_lint::{LintConfig, Linter, RuleCategory, RuleSeverity};
 
@@ -141,6 +142,43 @@ impl From<CategoryArg> for RuleCategory {
 fn main() -> ExitCode {
     let args = Args::parse();
 
+    // Discover Cargo.toml configuration from the first path argument
+    let cargo_overrides = args
+        .paths
+        .first()
+        .and_then(|p| {
+            let start = if p.is_file() {
+                p.parent().unwrap_or(p).to_path_buf()
+            } else {
+                p.clone()
+            };
+            match config::discover_config(&start) {
+                Ok(cfg) => {
+                    if !cfg.is_empty() {
+                        if let Some(ref src) = cfg.source {
+                            eprintln!(
+                                "{} Loaded qwasr lint config from {}",
+                                "note:".blue().bold(),
+                                src.display()
+                            );
+                        }
+                        Some(cfg)
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "{} Failed to load Cargo.toml config: {}",
+                        "warning:".yellow().bold(),
+                        e
+                    );
+                    None
+                }
+            }
+        })
+        .unwrap_or_default();
+
     // Build configuration
     let config = LintConfig {
         all_rules: args.categories.is_none(),
@@ -151,6 +189,7 @@ fn main() -> ExitCode {
         disabled_rules: args.disable.unwrap_or_default(),
         min_severity: args.severity.into(),
         show_fixes: args.show_fixes,
+        cargo_overrides,
     };
 
     let linter = Linter::new(config);

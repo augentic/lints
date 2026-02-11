@@ -68,6 +68,66 @@ pub enum RuleCategory {
     Auth,
 }
 
+impl RuleCategory {
+    /// All rule categories.
+    pub const ALL: &[RuleCategory] = &[
+        RuleCategory::Handler,
+        RuleCategory::Provider,
+        RuleCategory::Context,
+        RuleCategory::Error,
+        RuleCategory::Response,
+        RuleCategory::Wasm,
+        RuleCategory::Stateless,
+        RuleCategory::Performance,
+        RuleCategory::Security,
+        RuleCategory::StrongTyping,
+        RuleCategory::Caching,
+        RuleCategory::Time,
+        RuleCategory::Auth,
+    ];
+
+    /// Convert a snake_case string key to a `RuleCategory`.
+    ///
+    /// This is used when parsing `[lints.qwasr]` tables from `Cargo.toml`.
+    pub fn from_key(s: &str) -> Option<RuleCategory> {
+        match s {
+            "handler" => Some(RuleCategory::Handler),
+            "provider" => Some(RuleCategory::Provider),
+            "context" => Some(RuleCategory::Context),
+            "error" => Some(RuleCategory::Error),
+            "response" => Some(RuleCategory::Response),
+            "wasm" => Some(RuleCategory::Wasm),
+            "stateless" => Some(RuleCategory::Stateless),
+            "performance" => Some(RuleCategory::Performance),
+            "security" => Some(RuleCategory::Security),
+            "strong_typing" => Some(RuleCategory::StrongTyping),
+            "caching" => Some(RuleCategory::Caching),
+            "time" => Some(RuleCategory::Time),
+            "auth" => Some(RuleCategory::Auth),
+            _ => None,
+        }
+    }
+
+    /// Return the snake_case key for this category, as used in `Cargo.toml`.
+    pub fn as_key(&self) -> &'static str {
+        match self {
+            RuleCategory::Handler => "handler",
+            RuleCategory::Provider => "provider",
+            RuleCategory::Context => "context",
+            RuleCategory::Error => "error",
+            RuleCategory::Response => "response",
+            RuleCategory::Wasm => "wasm",
+            RuleCategory::Stateless => "stateless",
+            RuleCategory::Performance => "performance",
+            RuleCategory::Security => "security",
+            RuleCategory::StrongTyping => "strong_typing",
+            RuleCategory::Caching => "caching",
+            RuleCategory::Time => "time",
+            RuleCategory::Auth => "auth",
+        }
+    }
+}
+
 /// Severity of rule violations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum RuleSeverity {
@@ -79,6 +139,50 @@ pub enum RuleSeverity {
     Warning = 2,
     /// Error - code will not work or violates critical constraints.
     Error = 3,
+}
+
+/// The configured lint level from a `Cargo.toml` `[lints.qwasr]` table.
+///
+/// These mirror the standard Cargo lint levels:
+/// `"allow"`, `"warn"`, `"deny"`, and `"forbid"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LintLevel {
+    /// Suppress the lint entirely.
+    Allow,
+    /// Report as a warning.
+    Warn,
+    /// Report as an error.
+    Deny,
+    /// Report as an error (cannot be overridden downstream).
+    Forbid,
+}
+
+impl LintLevel {
+    /// Parse a Cargo.toml lint level string.
+    ///
+    /// Accepts both plain strings (`"warn"`) and the table form will be handled
+    /// by the config parser.
+    pub fn from_str(s: &str) -> Option<LintLevel> {
+        match s {
+            "allow" => Some(LintLevel::Allow),
+            "warn" => Some(LintLevel::Warn),
+            "deny" => Some(LintLevel::Deny),
+            "forbid" => Some(LintLevel::Forbid),
+            _ => None,
+        }
+    }
+
+    /// Convert to the closest `RuleSeverity` for filtering.
+    ///
+    /// `Allow` maps to `None` (suppressed), the rest map to a severity.
+    pub fn to_severity(self) -> Option<RuleSeverity> {
+        match self {
+            LintLevel::Allow => None,
+            LintLevel::Warn => Some(RuleSeverity::Warning),
+            LintLevel::Deny | LintLevel::Forbid => Some(RuleSeverity::Error),
+        }
+    }
 }
 
 /// Collection of all QWASR rules.

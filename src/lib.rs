@@ -17,16 +17,18 @@
 //! }
 //! ```
 
+pub mod config;
 pub mod constraints;
 pub mod diagnostics;
 pub mod output;
 pub mod rules;
 pub mod semantic;
 
+pub use config::CargoLintConfig;
 pub use diagnostics::{
     parse_ignore_directives, Diagnostic, DiagnosticsEngine, IgnoreDirective, Severity,
 };
-pub use rules::{Rule, RuleCategory, RuleSet, RuleSeverity};
+pub use rules::{LintLevel, Rule, RuleCategory, RuleSet, RuleSeverity};
 
 use anyhow::Result;
 use std::path::Path;
@@ -48,6 +50,9 @@ pub struct LintConfig {
 
     /// Whether to include fix suggestions in output.
     pub show_fixes: bool,
+
+    /// Cargo.toml-based severity overrides (populated from `[lints.qwasr]`).
+    pub cargo_overrides: CargoLintConfig,
 }
 
 impl Default for LintConfig {
@@ -58,6 +63,7 @@ impl Default for LintConfig {
             disabled_rules: vec![],
             min_severity: RuleSeverity::Hint,
             show_fixes: true,
+            cargo_overrides: CargoLintConfig::default(),
         }
     }
 }
@@ -97,25 +103,41 @@ impl Linter {
     fn filter_diagnostics(&self, diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
         diagnostics
             .into_iter()
-            .filter(|d| {
-                // Filter by severity
+            .filter_map(|mut d| {
+                // Apply Cargo.toml severity overrides first
+                if !self.config.cargo_overrides.is_empty() {
+                    if let Some(level) = self
+                        .config
+                        .cargo_overrides
+                        .effective_level(&d.rule_id, d.category)
+                    {
+                        match level.to_severity() {
+                            // `allow` → suppress entirely
+                            None => return None,
+                            // Override the severity
+                            Some(sev) => d.severity = sev,
+                        }
+                    }
+                }
+
+                // Filter by minimum severity (CLI --severity flag)
                 if d.severity < self.config.min_severity {
-                    return false;
+                    return None;
                 }
 
-                // Filter by disabled rules
+                // Filter by disabled rules (CLI --disable flag)
                 if self.config.disabled_rules.contains(&d.rule_id) {
-                    return false;
+                    return None;
                 }
 
-                // Filter by categories if specified
+                // Filter by categories if specified (CLI --categories flag)
                 if !self.config.categories.is_empty()
                     && !self.config.categories.contains(&d.category)
                 {
-                    return false;
+                    return None;
                 }
 
-                true
+                Some(d)
             })
             .collect()
     }
