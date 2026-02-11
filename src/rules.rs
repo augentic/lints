@@ -252,7 +252,7 @@ fn create_all_rules() -> Vec<Rule> {
             category: RuleCategory::Handler,
             severity: RuleSeverity::Error,
             description: "The handle method must be async to support asynchronous provider operations.",
-            pattern: Regex::new(r"fn\s+handle\s*\(").unwrap(),
+            pattern: Regex::new(r"^\s*fn\s+handle\s*\(").unwrap(),
             is_anti_pattern: true,
             fix_template: Some("async fn handle(self, ctx: Context<'_, P>) -> Result<Reply<Self::Output>>"),
             doc_reference: "handler-trait.md",

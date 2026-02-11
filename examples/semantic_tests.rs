@@ -60,7 +60,7 @@ where
 // TEST 4: Correct bounds (should have no warnings)
 // ============================================================
 impl<P: Config + HttpRequest> Handler<P> for CorrectRequest {
-    async fn handle(self, ctx: Context<'_, P>) -> Result<Reply<Self::Output>> {
+    fn handle(self, ctx: Context<'_, P>) -> Result<Reply<Self::Output>> {
         let url = ctx.provider.get("API_URL")?;
         let response = ctx.provider.fetch(request).await?;
         Ok(Reply::ok(Response {}))
