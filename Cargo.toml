@@ -1,0 +1,51 @@
+[package]
+name = "qwasr-lint"
+version = "0.1.0"
+edition = "2021"
+description = "A custom Rust linter for QWASR WASM32 handler development"
+authors = ["Augentic Team"]
+license = "MIT"
+readme = "README.md"
+keywords = ["linter", "wasm", "qwasr", "rust-analyzer"]
+categories = ["development-tools", "wasm"]
+
+[[bin]]
+name = "qwasr-lint"
+path = "src/main.rs"
+
+[lib]
+name = "qwasr_lint"
+path = "src/lib.rs"
+
+[dependencies]
+# CLI argument parsing
+clap = { version = "4.4", features = ["derive"] }
+
+# Regex for pattern matching
+regex = "1.10"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.9.8"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0.18"
+
+# File walking
+walkdir = "2.4"
+
+# Colored terminal output
+colored = "3.1.1"
+
+# Parallel processing
+rayon = "1.8"
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
