@@ -1,29 +1,54 @@
-# QWASR LSP Rules Reference
+# Omnia LSP Rules Reference
 
-This document provides a comprehensive reference of all validation rules enforced by the QWASR Language Server Protocol (LSP). The LSP analyzes Rust code for WASM32 handler development and enforces best practices across **15 categories**.
+This document provides a comprehensive reference of all validation rules enforced by the Omnia Language Server Protocol (LSP). The LSP analyzes Rust code for WASM32 handler development and enforces best practices across **15 categories**.
 
 ---
 
 ## Table of Contents
 
-1. [Handler Rules](#1-handler-rules)
-2. [Provider Rules](#2-provider-rules)
-3. [Semantic Analysis Rules](#3-semantic-analysis-rules) 
-4. [Context Rules](#4-context-rules)
-5. [Error Handling Rules](#5-error-handling-rules)
-6. [Response Rules](#6-response-rules)
-7. [WASM Compatibility Rules](#7-wasm-compatibility-rules)
-8. [Statelessness Rules](#8-statelessness-rules)
-9. [Performance Rules](#9-performance-rules)
-10. [Security Rules](#10-security-rules)
-11. [Strong Typing Rules](#11-strong-typing-rules)
-12. [Time Rules](#12-time-rules)
-13. [Auth Rules](#13-auth-rules)
-14. [Caching Rules](#14-caching-rules)
-15. [Forbidden Crates](#15-forbidden-crates)
-16. [Forbidden Patterns](#16-forbidden-patterns)
-17. [Provider Traits Reference](#17-provider-traits-reference)
-18. [Error Macros Reference](#18-error-macros-reference)
+- [Omnia LSP Rules Reference](#omnia-lsp-rules-reference)
+  - [Table of Contents](#table-of-contents)
+  - [Severity Levels](#severity-levels)
+  - [1. Handler Rules](#1-handler-rules)
+    - [Handler Required Types](#handler-required-types)
+    - [Handler Required Methods](#handler-required-methods)
+    - [Handler Best Practices](#handler-best-practices)
+  - [2. Provider Rules](#2-provider-rules)
+    - [HTTP Fetch Example](#http-fetch-example)
+  - [3. Semantic Analysis Rules ⭐ NEW](#3-semantic-analysis-rules--new)
+    - [Handler Provider Bound Analysis](#handler-provider-bound-analysis)
+      - [Example: Unused Bound Detection](#example-unused-bound-detection)
+      - [Example: Missing Bound Detection](#example-missing-bound-detection)
+    - [Helper Function Provider Bound Analysis](#helper-function-provider-bound-analysis)
+      - [Example: Helper Function Analysis](#example-helper-function-analysis)
+    - [StateStore TTL Analysis](#statestore-ttl-analysis)
+      - [Example: TTL Warning](#example-ttl-warning)
+    - [Error Context Hints](#error-context-hints)
+    - [Automatic Fix Summary](#automatic-fix-summary)
+    - [How Trait Usage Is Detected](#how-trait-usage-is-detected)
+  - [4. Context Rules](#4-context-rules)
+  - [5. Error Handling Rules](#5-error-handling-rules)
+  - [6. Response Rules](#6-response-rules)
+  - [7. WASM Compatibility Rules](#7-wasm-compatibility-rules)
+  - [8. Statelessness Rules](#8-statelessness-rules)
+  - [9. Performance Rules](#9-performance-rules)
+  - [10. Security Rules](#10-security-rules)
+  - [11. Strong Typing Rules](#11-strong-typing-rules)
+  - [12. Time Rules](#12-time-rules)
+  - [13. Auth Rules](#13-auth-rules)
+  - [14. Caching Rules](#14-caching-rules)
+  - [15. Forbidden Crates](#15-forbidden-crates)
+  - [16. Forbidden Patterns](#16-forbidden-patterns)
+  - [17. Provider Traits Reference](#17-provider-traits-reference)
+    - [Config](#config)
+    - [HttpRequest](#httprequest)
+    - [Publisher](#publisher)
+    - [StateStore](#statestore)
+    - [TableStore](#tablestore)
+    - [Identity](#identity)
+  - [18. Error Macros Reference](#18-error-macros-reference)
+  - [Summary Statistics](#summary-statistics)
+  - [Quick Reference: Critical Errors to Avoid](#quick-reference-critical-errors-to-avoid)
 
 ---
 
@@ -50,14 +75,14 @@ Rules governing the implementation of the `Handler` trait.
 | `handler_async_handle` | Handle Method is Async | Error | The `handle` method must be `async` to support asynchronous provider operations | `async fn handle(self, ctx: Context<'_, P>) -> Result<Reply<Self::Output>>` |
 | `handler_context_lifetime` | Context Lifetime Parameter | Warning | Context should use the elided lifetime `Context<'_, P>` for clarity | `Context<'_, P>` |
 | `handler_output_type` | Handler Output Type Definition | Error | Handler must define `type Output = ResponseType;` to specify the response type | `type Output = ResponseType;` |
-| `handler_error_type` | Handler Error Type | Warning | Handler should use `type Error = qwasr_sdk::Error` for proper HTTP status mapping | `type Error = Error;` |
+| `handler_error_type` | Handler Error Type | Warning | Handler should use `type Error = omnia_sdk::Error` for proper HTTP status mapping | `type Error = Error;` |
 | `handler_input_vec_u8` | Handler Input Type | Info | Handler Input is typically `Vec<u8>` for raw bytes from HTTP body | `type Input = Vec<u8>;` |
 
 ### Handler Required Types
 
 | Type Name | Typical Value | Description |
 |-----------|---------------|-------------|
-| `Error` | `qwasr_sdk::Error` | Error type for handler operations. Must support HTTP status code mapping |
+| `Error` | `omnia_sdk::Error` | Error type for handler operations. Must support HTTP status code mapping |
 | `Input` | `Vec<u8>` | Raw input type, typically `Vec<u8>` for HTTP body bytes |
 | `Output` | `ResponseType` | Response type that will be serialized to JSON |
 
@@ -238,7 +263,7 @@ Rules for accessing the Context object.
 
 ## 5. Error Handling Rules
 
-Comprehensive rules for proper error handling in QWASR handlers.
+Comprehensive rules for proper error handling in Omnia handlers.
 
 | Rule ID | Name | Severity | Description | Fix Template |
 |---------|------|----------|-------------|--------------|
@@ -256,8 +281,8 @@ Comprehensive rules for proper error handling in QWASR handlers.
 | `error_missing_context_serde` | Serde Deserialize Without Context | Warning | `serde_json::from_*` should use `.context()` for meaningful error messages | `serde_json::from_slice(&data).context("deserializing MyType")?` |
 | `error_missing_context_parse` | Parse Without Context | Warning | Parsing operations should use `.context()` for meaningful error messages | `.parse().context("parsing field_name")?` |
 | `error_dynamic_code` | Error Code Should Be Static | Warning | Error codes should be stable static strings, not dynamically generated with `format!` | `code: "error_code".to_string()` |
-| `error_anyhow_in_handler` | Use qwasr_sdk::Error | Warning | Handler Error type should be `qwasr_sdk::Error` for proper HTTP status mapping | `type Error = qwasr_sdk::Error;` |
-| `error_impl_from_required` | Domain Error Missing From impl | Info | Domain error enums should implement `From<DomainError> for qwasr_sdk::Error` | `impl From<DomainError> for qwasr_sdk::Error { ... }` |
+| `error_anyhow_in_handler` | Use omnia_sdk::Error | Warning | Handler Error type should be `omnia_sdk::Error` for proper HTTP status mapping | `type Error = omnia_sdk::Error;` |
+| `error_impl_from_required` | Domain Error Missing From impl | Info | Domain error enums should implement `From<DomainError> for omnia_sdk::Error` | `impl From<DomainError> for omnia_sdk::Error { ... }` |
 | `error_map_to_bad_request` | Map Parsing Errors to BadRequest | Info | Parsing/validation errors should map to `bad_request!` (400), not `server_error!` (500) | Use `bad_request!("invalid input: {}", err)` |
 | `error_map_to_bad_gateway` | Map Upstream Errors to BadGateway | Info | External service/API errors should map to `bad_gateway!` (502), not `server_error!` (500) | Use `bad_gateway!("upstream failed: {}", err)` |
 | `error_result_map_err` | Use map_err for Error Conversion | Info | Use `.map_err(Into::into)` or `.map_err(\|e\| bad_request!(...))` for explicit error conversion | N/A |
@@ -297,14 +322,14 @@ Critical rules for WASM32 compatibility.
 
 ## 8. Statelessness Rules
 
-QWASR handlers must be stateless. These rules enforce that constraint.
+Omnia handlers must be stateless. These rules enforce that constraint.
 
 | Rule ID | Name | Severity | Description | Fix Template |
 |---------|------|----------|-------------|--------------|
-| `stateless_static_mut` | No static mut | Error | `static mut` creates global mutable state. QWASR handlers must be stateless | Use StateStore provider for state persistence |
-| `stateless_lazy_static` | No lazy_static | Error | `lazy_static` creates global state. Not allowed in QWASR | Pass state through Context or use StateStore |
-| `stateless_once_cell` | No OnceCell/OnceLock | Error | `OnceCell`/`OnceLock` create global state. Not allowed in QWASR | Use StateStore provider |
-| `stateless_lazy_lock` | No LazyLock | Error | `LazyLock` (std 1.80+) creates global state which is forbidden in QWASR WASM | Use Config provider trait instead |
+| `stateless_static_mut` | No static mut | Error | `static mut` creates global mutable state. Omnia handlers must be stateless | Use StateStore provider for state persistence |
+| `stateless_lazy_static` | No lazy_static | Error | `lazy_static` creates global state. Not allowed in Omnia | Pass state through Context or use StateStore |
+| `stateless_once_cell` | No OnceCell/OnceLock | Error | `OnceCell`/`OnceLock` create global state. Not allowed in Omnia | Use StateStore provider |
+| `stateless_lazy_lock` | No LazyLock | Error | `LazyLock` (std 1.80+) creates global state which is forbidden in Omnia WASM | Use Config provider trait instead |
 | `stateless_arc_mutex` | Avoid Arc<Mutex> | Warning | `Arc<Mutex<T>>` suggests shared mutable state. Use StateStore instead | Use StateStore provider for shared state |
 | `stateless_mutex` | Avoid Mutex/RwLock | Warning | `Mutex` and `RwLock` create shared mutable state. WASM is single-threaded | Use StateStore provider for shared state |
 
@@ -382,7 +407,7 @@ Rules for proper cache usage.
 
 ## 15. Forbidden Crates
 
-These crates are **completely forbidden** in QWASR WASM32 code:
+These crates are **completely forbidden** in Omnia WASM32 code:
 
 | Category | Crates | Reason |
 |----------|--------|--------|
@@ -427,7 +452,7 @@ Anti-patterns that are detected and flagged.
 
 **Purpose:** Read configuration values from WASI config.
 
-**WASI Module:** `qwasr_wasi_config`
+**WASI Module:** `omnia_wasi_config`
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
@@ -444,7 +469,7 @@ let url = Config::get(provider, "API_URL").await?;
 
 **Purpose:** Make outbound HTTP requests via WASI HTTP.
 
-**WASI Module:** `qwasr_wasi_http`
+**WASI Module:** `omnia_wasi_http`
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
@@ -461,7 +486,7 @@ let response = HttpRequest::fetch(provider, request).await?;
 
 **Purpose:** Publish messages to topics via WASI messaging.
 
-**WASI Module:** `qwasr_wasi_messaging`
+**WASI Module:** `omnia_wasi_messaging`
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
@@ -478,7 +503,7 @@ Publisher::send(provider, "my-topic", &message).await?;
 
 **Purpose:** Cache/KV operations via WASI keyvalue.
 
-**WASI Module:** `qwasr_wasi_keyvalue`
+**WASI Module:** `omnia_wasi_keyvalue`
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
@@ -574,4 +599,4 @@ let token = ctx.provider.access_token("github").await?;
 
 ---
 
-*Generated from QWASR LSP source code analysis.*
+*Generated from Omnia LSP source code analysis.*

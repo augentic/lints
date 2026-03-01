@@ -1,49 +1,43 @@
 [package]
-name = "qwasr-lint"
+name = "omnia-lint"
 version = "0.1.0"
-edition = "2021"
-description = "A custom Rust linter for QWASR WASM32 handler development"
-authors = ["Augentic Team"]
+edition = "2024"
+description = "Custom lints for Omnia handler development"
+authors = ["Augentic"]
 license = "MIT"
 readme = "README.md"
-keywords = ["linter", "wasm", "qwasr", "rust-analyzer"]
+keywords = ["linter", "wasm", "omnia", "rust-analyzer"]
 categories = ["development-tools", "wasm"]
 
 [[bin]]
-name = "qwasr-lint"
+name = "omnia-lint"
 path = "src/main.rs"
 
 [lib]
-name = "qwasr_lint"
+name = "omnia_lint"
 path = "src/lib.rs"
 
 [dependencies]
-# CLI argument parsing
-clap = { version = "4.4", features = ["derive"] }
-
-# Regex for pattern matching
-regex = "1.10"
-
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+clap = { version = "4.5.60", features = ["derive"] }
+regex = "1.12.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 toml = "0.9.8"
-
-# Error handling
-anyhow = "1.0"
+anyhow = "1.0.102"
 thiserror = "2.0.18"
-
-# File walking
-walkdir = "2.4"
-
-# Colored terminal output
+walkdir = "2.5.0"
 colored = "3.1.1"
+rayon = "1.11.0"
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
 
-# Parallel processing
-rayon = "1.8"
 
 [dev-dependencies]
-tempfile = "3.10"
+bytes = "1.11"
+http = "1.4"
+http-body-util = "0.1"
+omnia-sdk = "0.28.0"
+tempfile = "3.26.0"
 
 [profile.release]
 lto = true

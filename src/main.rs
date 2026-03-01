@@ -1,23 +1,21 @@
-//! QWASR Lint CLI - Command-line interface for the QWASR linter.
+//! Omnia Lint CLI - Command-line interface for the Omnia linter.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 use colored::Colorize;
+use omnia_lint::output::{DiagnosticSummary, OutputFormat, format_diagnostics, format_json_all};
+use omnia_lint::{LintConfig, Linter, RuleCategory, RuleSeverity, config};
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
-use qwasr_lint::config;
-use qwasr_lint::output::{format_diagnostics, OutputFormat};
-use qwasr_lint::{LintConfig, Linter, RuleCategory, RuleSeverity};
-
-/// QWASR Lint - A custom Rust linter for WASM32 handler development
+/// Omnia Lint - A custom Rust linter for WASM32 handler development
 #[derive(Parser, Debug)]
-#[command(name = "qwasr-lint")]
+#[command(name = "omnia-lint")]
 #[command(author = "Augentic Team")]
 #[command(version = "0.1.0")]
-#[command(about = "Lint Rust code for QWASR WASM32 handler compliance", long_about = None)]
+#[command(about = "Lint Rust code for Omnia WASM32 handler compliance", long_about = None)]
 struct Args {
     /// Files or directories to lint
     #[arg(required = true)]
@@ -147,17 +145,13 @@ fn main() -> ExitCode {
         .paths
         .first()
         .and_then(|p| {
-            let start = if p.is_file() {
-                p.parent().unwrap_or(p).to_path_buf()
-            } else {
-                p.clone()
-            };
+            let start = if p.is_file() { p.parent().unwrap_or(p).to_path_buf() } else { p.clone() };
             match config::discover_config(&start) {
                 Ok(cfg) => {
                     if !cfg.is_empty() {
                         if let Some(ref src) = cfg.source {
                             eprintln!(
-                                "{} Loaded qwasr lint config from {}",
+                                "{} Loaded omnia lint config from {}",
                                 "note:".blue().bold(),
                                 src.display()
                             );
@@ -203,7 +197,7 @@ fn main() -> ExitCode {
                 WalkDir::new(path)
                     .into_iter()
                     .filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().map_or(false, |ext| ext == "rs"))
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
                     .map(|e| e.path().to_path_buf())
                     .collect::<Vec<_>>()
             } else {
@@ -229,37 +223,37 @@ fn main() -> ExitCode {
         })
         .collect();
 
-    // Aggregate statistics
-    let mut total_errors = 0;
-    let mut total_warnings = 0;
-    let mut total_info = 0;
-    let mut total_hints = 0;
+    // Flatten all diagnostics for summary, truncation, and JSON output
+    let all_diagnostics: Vec<(&PathBuf, &omnia_lint::Diagnostic)> = results
+        .iter()
+        .flat_map(|(file, diags)| diags.iter().map(move |d| (file, d)))
+        .collect();
+
+    let summary = DiagnosticSummary::from_diagnostics(
+        &all_diagnostics.iter().map(|(_, d)| (*d).clone()).collect::<Vec<_>>(),
+    );
+
+    // Collect per-rule counts for --stats
     let mut rule_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-
-    let mut all_diagnostics = Vec::new();
-
-    for (file, diagnostics) in &results {
-        for diag in diagnostics {
-            match diag.severity {
-                RuleSeverity::Error => total_errors += 1,
-                RuleSeverity::Warning => total_warnings += 1,
-                RuleSeverity::Info => total_info += 1,
-                RuleSeverity::Hint => total_hints += 1,
-            }
-            *rule_counts.entry(diag.rule_id.clone()).or_insert(0) += 1;
-            all_diagnostics.push((file.clone(), diag.clone()));
-        }
+    for (_, diag) in &all_diagnostics {
+        *rule_counts.entry(diag.rule_id.clone()).or_insert(0) += 1;
     }
 
-    // Apply max diagnostics limit
-    if args.max_diagnostics > 0 && all_diagnostics.len() > args.max_diagnostics {
-        all_diagnostics.truncate(args.max_diagnostics);
+    // Apply max diagnostics limit (consistently across all formats)
+    let truncated = args.max_diagnostics > 0 && all_diagnostics.len() > args.max_diagnostics;
+    let display_count = if args.max_diagnostics > 0 {
+        all_diagnostics.len().min(args.max_diagnostics)
+    } else {
+        all_diagnostics.len()
+    };
+
+    if truncated {
         eprintln!(
             "{} Showing first {} of {} diagnostics",
             "Note:".blue().bold(),
             args.max_diagnostics,
-            total_errors + total_warnings + total_info + total_hints
+            summary.total
         );
     }
 
@@ -267,56 +261,40 @@ fn main() -> ExitCode {
     let output_format: OutputFormat = args.format.into();
 
     if matches!(output_format, OutputFormat::Json) {
-        // For JSON, output all diagnostics as a single JSON array
-        let json_diagnostics: Vec<_> = all_diagnostics
+        let limited: Vec<_> = all_diagnostics
             .iter()
-            .map(|(file, diag)| {
-                serde_json::json!({
-                    "file": file.display().to_string(),
-                    "line": diag.line,
-                    "column": diag.column,
-                    "end_column": diag.end_column,
-                    "severity": format!("{:?}", diag.severity).to_lowercase(),
-                    "rule_id": diag.rule_id,
-                    "rule_name": diag.rule_name,
-                    "category": format!("{:?}", diag.category),
-                    "message": diag.message,
-                    "fix": diag.fix_template,
-                })
-            })
+            .take(display_count)
+            .map(|(f, d)| (f.as_path(), *d))
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json_diagnostics).unwrap()
-        );
+        println!("{}", format_json_all(&limited));
     } else {
-        // For other formats, group by file
+        let mut shown = 0;
         for (file, diagnostics) in &results {
             if diagnostics.is_empty() && args.quiet {
                 continue;
             }
-
-            if !diagnostics.is_empty() || !args.quiet {
-                let output = format_diagnostics(file, diagnostics, output_format, args.show_fixes);
-                print!("{}", output);
+            if diagnostics.is_empty() && !args.quiet {
+                let output = format_diagnostics(file, &[], output_format, args.show_fixes);
+                print!("{output}");
+                continue;
             }
+
+            let remaining = display_count.saturating_sub(shown);
+            if remaining == 0 {
+                break;
+            }
+            let to_show = diagnostics.len().min(remaining);
+            let output =
+                format_diagnostics(file, &diagnostics[..to_show], output_format, args.show_fixes);
+            print!("{output}");
+            shown += to_show;
         }
     }
 
     // Print summary
-    let total = total_errors + total_warnings + total_info + total_hints;
-
-    if total > 0 {
+    if summary.total > 0 {
         println!();
-        println!(
-            "{} {} ({} errors, {} warnings, {} info, {} hints)",
-            "Found".bold(),
-            format!("{} issues", total).bold(),
-            total_errors.to_string().red().bold(),
-            total_warnings.to_string().yellow().bold(),
-            total_info.to_string().blue(),
-            total_hints.to_string().dimmed()
-        );
+        println!("{} {}", "Found".bold(), summary.format_pretty());
     } else {
         println!("{}", "✓ No issues found!".green().bold());
     }
@@ -333,9 +311,7 @@ fn main() -> ExitCode {
     }
 
     // Determine exit code
-    if total_errors > 0 {
-        ExitCode::from(1)
-    } else if args.error_on_warnings && total_warnings > 0 {
+    if summary.errors > 0 || (args.error_on_warnings && summary.warnings > 0) {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS

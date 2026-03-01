@@ -1,14 +1,14 @@
-//! Cargo.toml configuration discovery and parsing for `qwasr-lint`.
+//! Cargo.toml configuration discovery and parsing for `omnia-lint`.
 //!
-//! Reads the `[lints.qwasr]` or `[workspace.lints.qwasr]` table from the
+//! Reads the `[lints.omnia]` or `[workspace.lints.omnia]` table from the
 //! nearest `Cargo.toml` and produces a [`CargoLintConfig`] that the linter
 //! uses to override default rule severities.
 //!
 //! # Cargo.toml format
 //!
 //! ```toml
-//! [workspace.lints.qwasr]
-//! # Set the default level for every qwasr category:
+//! [workspace.lints.omnia]
+//! # Set the default level for every omnia category:
 //! all = "warn"
 //!
 //! # Override individual categories:
@@ -22,8 +22,8 @@
 //! perf_clone_in_loop   = "allow"
 //! ```
 //!
-//! Crate-level `[lints.qwasr]` tables are merged on top of
-//! `[workspace.lints.qwasr]` when both exist (crate wins).
+//! Crate-level `[lints.omnia]` tables are merged on top of
+//! `[workspace.lints.omnia]` when both exist (crate wins).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ use anyhow::{Context, Result};
 
 use crate::rules::{LintLevel, RuleCategory};
 
-/// Configuration extracted from a `Cargo.toml` `[lints.qwasr]` table.
+/// Configuration extracted from a `Cargo.toml` `[lints.omnia]` table.
 #[derive(Debug, Clone, Default)]
 pub struct CargoLintConfig {
     /// The `Cargo.toml` this config was loaded from (for diagnostics).
@@ -115,7 +115,7 @@ pub fn find_cargo_toml(start_dir: &Path) -> Option<PathBuf> {
 
 /// Load a [`CargoLintConfig`] from a `Cargo.toml` file.
 ///
-/// Reads both `[workspace.lints.qwasr]` and `[lints.qwasr]`, merging
+/// Reads both `[workspace.lints.omnia]` and `[lints.omnia]`, merging
 /// workspace first, then crate-level on top.
 pub fn load_cargo_lint_config(cargo_toml: &Path) -> Result<CargoLintConfig> {
     let content = std::fs::read_to_string(cargo_toml)
@@ -129,32 +129,28 @@ pub fn load_cargo_lint_config(cargo_toml: &Path) -> Result<CargoLintConfig> {
         ..Default::default()
     };
 
-    // 1. workspace.lints.qwasr
+    // 1. workspace.lints.omnia
     if let Some(table) = doc
         .get("workspace")
         .and_then(|w| w.get("lints"))
-        .and_then(|l| l.get("qwasr"))
+        .and_then(|l| l.get("omnia"))
         .and_then(|q| q.as_table())
     {
         merge_toml_table(&mut config, table);
     }
 
-    // 2. lints.qwasr (crate-level, wins over workspace)
-    if let Some(table) = doc
-        .get("lints")
-        .and_then(|l| l.get("qwasr"))
-        .and_then(|q| q.as_table())
-    {
+    // 2. lints.omnia (crate-level, wins over workspace)
+    if let Some(table) = doc.get("lints").and_then(|l| l.get("omnia")).and_then(|q| q.as_table()) {
         merge_toml_table(&mut config, table);
     }
 
     Ok(config)
 }
 
-/// Discover and load the qwasr lint config for a given path.
+/// Discover and load the omnia lint config for a given path.
 ///
 /// Walks up from `path` looking for the nearest `Cargo.toml` with a
-/// `[lints.qwasr]` or `[workspace.lints.qwasr]` section.
+/// `[lints.omnia]` or `[workspace.lints.omnia]` section.
 pub fn discover_config(path: &Path) -> Result<CargoLintConfig> {
     match find_cargo_toml(path) {
         Some(cargo_toml) => load_cargo_lint_config(&cargo_toml),
@@ -174,11 +170,10 @@ pub fn discover_config(path: &Path) -> Result<CargoLintConfig> {
 ///     for now but accepted for Cargo compatibility)
 fn parse_lint_level(value: &toml::Value) -> Option<LintLevel> {
     match value {
-        toml::Value::String(s) => LintLevel::from_str(s),
-        toml::Value::Table(t) => t
-            .get("level")
-            .and_then(|v| v.as_str())
-            .and_then(LintLevel::from_str),
+        toml::Value::String(s) => LintLevel::parse(s),
+        toml::Value::Table(t) => {
+            t.get("level").and_then(|v| v.as_str()).and_then(LintLevel::parse)
+        }
         _ => None,
     }
 }
@@ -214,7 +209,7 @@ mod tests {
     #[test]
     fn test_parse_simple_levels() {
         let toml_str = r#"
-[workspace.lints.qwasr]
+[workspace.lints.omnia]
 all = "warn"
 handler = "deny"
 wasm = "forbid"
@@ -226,7 +221,7 @@ error_generic_unwrap = "allow"
             .unwrap()
             .get("lints")
             .unwrap()
-            .get("qwasr")
+            .get("omnia")
             .unwrap()
             .as_table()
             .unwrap();
@@ -235,24 +230,15 @@ error_generic_unwrap = "allow"
         merge_toml_table(&mut config, table);
 
         assert_eq!(config.all, Some(LintLevel::Warn));
-        assert_eq!(
-            config.categories.get(&RuleCategory::Handler),
-            Some(&LintLevel::Deny)
-        );
-        assert_eq!(
-            config.categories.get(&RuleCategory::Wasm),
-            Some(&LintLevel::Forbid)
-        );
-        assert_eq!(
-            config.rules.get("error_generic_unwrap"),
-            Some(&LintLevel::Allow)
-        );
+        assert_eq!(config.categories.get(&RuleCategory::Handler), Some(&LintLevel::Deny));
+        assert_eq!(config.categories.get(&RuleCategory::Wasm), Some(&LintLevel::Forbid));
+        assert_eq!(config.rules.get("error_generic_unwrap"), Some(&LintLevel::Allow));
     }
 
     #[test]
     fn test_parse_table_form() {
         let toml_str = r#"
-[workspace.lints.qwasr]
+[workspace.lints.omnia]
 all = "warn"
 handler = { level = "deny", priority = 1 }
 "#;
@@ -262,7 +248,7 @@ handler = { level = "deny", priority = 1 }
             .unwrap()
             .get("lints")
             .unwrap()
-            .get("qwasr")
+            .get("omnia")
             .unwrap()
             .as_table()
             .unwrap();
@@ -271,22 +257,15 @@ handler = { level = "deny", priority = 1 }
         merge_toml_table(&mut config, table);
 
         assert_eq!(config.all, Some(LintLevel::Warn));
-        assert_eq!(
-            config.categories.get(&RuleCategory::Handler),
-            Some(&LintLevel::Deny)
-        );
+        assert_eq!(config.categories.get(&RuleCategory::Handler), Some(&LintLevel::Deny));
     }
 
     #[test]
     fn test_effective_level_precedence() {
         let mut config = CargoLintConfig::default();
         config.all = Some(LintLevel::Warn);
-        config
-            .categories
-            .insert(RuleCategory::Error, LintLevel::Deny);
-        config
-            .rules
-            .insert("error_generic_unwrap".to_string(), LintLevel::Allow);
+        config.categories.insert(RuleCategory::Error, LintLevel::Deny);
+        config.rules.insert("error_generic_unwrap".to_string(), LintLevel::Allow);
 
         // Rule override wins
         assert_eq!(
@@ -308,31 +287,21 @@ handler = { level = "deny", priority = 1 }
     #[test]
     fn test_effective_level_none_when_empty() {
         let config = CargoLintConfig::default();
-        assert_eq!(
-            config.effective_level("handler_generic_p", RuleCategory::Handler),
-            None
-        );
+        assert_eq!(config.effective_level("handler_generic_p", RuleCategory::Handler), None);
     }
 
     #[test]
     fn test_merge_crate_wins() {
         let mut workspace = CargoLintConfig::default();
         workspace.all = Some(LintLevel::Warn);
-        workspace
-            .categories
-            .insert(RuleCategory::Handler, LintLevel::Deny);
+        workspace.categories.insert(RuleCategory::Handler, LintLevel::Deny);
 
         let mut crate_level = CargoLintConfig::default();
-        crate_level
-            .categories
-            .insert(RuleCategory::Handler, LintLevel::Allow);
+        crate_level.categories.insert(RuleCategory::Handler, LintLevel::Allow);
 
         workspace.merge(&crate_level);
 
         assert_eq!(workspace.all, Some(LintLevel::Warn));
-        assert_eq!(
-            workspace.categories.get(&RuleCategory::Handler),
-            Some(&LintLevel::Allow)
-        );
+        assert_eq!(workspace.categories.get(&RuleCategory::Handler), Some(&LintLevel::Allow));
     }
 }

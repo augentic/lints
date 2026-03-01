@@ -1,4 +1,4 @@
-//! Semantic analysis for QWASR code.
+//! Semantic analysis for Omnia code.
 //!
 //! This module provides deeper code analysis beyond simple pattern matching,
 //! including:
@@ -6,10 +6,18 @@
 //! - Trait usage tracking
 //! - Handler implementation validation
 //! - Transitive trait detection through function delegation
+//!
+//! The extraction layer uses `syn` for AST-based parsing, making it robust
+//! against false positives from string literals, comments, and multi-line
+//! formatting. The analysis logic (transitive resolution, diagnostic
+//! generation) operates on the extracted data structures.
 
 use std::collections::{HashMap, HashSet};
 
 use regex::Regex;
+use syn::spanned::Spanned;
+use syn::visit::Visit;
+use syn::{Expr, ExprAwait, ExprField, ExprMethodCall, ExprPath, Item};
 
 use crate::diagnostics::Diagnostic;
 use crate::rules::{RuleCategory, RuleSeverity};
@@ -90,433 +98,489 @@ pub struct TraitUsage {
     pub col_range: (usize, usize),
 }
 
-/// Pattern for detecting trait method usage.
-struct TraitMethodPattern {
-    trait_name: &'static str,
-    #[allow(dead_code)]
-    methods: Vec<&'static str>,
-    patterns: Vec<Regex>,
+// ---------------------------------------------------------------------------
+// syn-based AST extraction
+// ---------------------------------------------------------------------------
+
+/// Check if a name is a known Omnia provider trait.
+fn is_provider_trait(name: &str) -> bool {
+    matches!(
+        name,
+        "Config" | "HttpRequest" | "Publisher" | "StateStore" | "Identity" | "TableStore"
+    )
 }
 
-/// Semantic analyzer for QWASR code.
-pub struct SemanticAnalyzer {
-    /// Regex for detecting Handler impl blocks.
-    handler_impl_re: Regex,
-
-    /// Regex for extracting provider bounds.
-    bounds_re: Regex,
-
-    /// Regex for detecting where clause bounds.
-    where_bounds_re: Regex,
-
-    /// Provider trait method patterns for usage detection.
-    trait_method_patterns: Vec<TraitMethodPattern>,
-
-    /// Regex for detecting async function definitions with provider bounds.
-    fn_with_provider_re: Regex,
-
-    /// Regex for detecting function calls (for transitive trait tracking).
-    function_call_re: Regex,
+/// Extract the last segment name from a `syn::Path` (e.g. `omnia_sdk::Config` -> `"Config"`).
+fn last_segment_name(path: &syn::Path) -> String {
+    path.segments
+        .last()
+        .map(|s| s.ident.to_string())
+        .unwrap_or_default()
 }
 
-impl SemanticAnalyzer {
-    /// Create a new semantic analyzer.
-    pub fn new() -> Self {
-        let trait_method_patterns = vec![
-            TraitMethodPattern {
-                trait_name: "Config",
-                methods: vec!["get"],
-                patterns: vec![
-                    Regex::new(r#"(?:ctx\.)?provider\.get\s*\(\s*"[^"]+"\s*\)"#).unwrap(),
-                    Regex::new(r#"Config::get\s*\("#).unwrap(),
-                    Regex::new(r#"\.get\s*\(\s*"[A-Z_]+"\s*\)"#).unwrap(),
-                ],
-            },
-            TraitMethodPattern {
-                trait_name: "HttpRequest",
-                methods: vec!["fetch"],
-                patterns: vec![
-                    Regex::new(r"(?:ctx\.)?provider\.fetch\s*\(").unwrap(),
-                    Regex::new(r"HttpRequest::fetch\s*\(").unwrap(),
-                ],
-            },
-            TraitMethodPattern {
-                trait_name: "Publisher",
-                methods: vec!["send"],
-                patterns: vec![
-                    Regex::new(r"(?:ctx\.)?provider\.send\s*\(").unwrap(),
-                    Regex::new(r"Publisher::send\s*\(").unwrap(),
-                ],
-            },
-            TraitMethodPattern {
-                trait_name: "StateStore",
-                methods: vec!["get", "set", "delete"],
-                patterns: vec![
-                    Regex::new(r"StateStore::(?:get|set|delete)\s*\(").unwrap(),
-                    Regex::new(r"(?:ctx\.)?provider\.(?:get|set|delete)\s*\([^)]*\)\.await")
-                        .unwrap(),
-                ],
-            },
-            TraitMethodPattern {
-                trait_name: "Identity",
-                methods: vec!["access_token"],
-                patterns: vec![
-                    Regex::new(r"(?:ctx\.)?provider\.access_token\s*\(").unwrap(),
-                    Regex::new(r"Identity::access_token\s*\(").unwrap(),
-                ],
-            },
-            TraitMethodPattern {
-                trait_name: "TableStore",
-                methods: vec!["query", "exec"],
-                patterns: vec![
-                    Regex::new(r"(?:ctx\.)?provider\.query\s*\(").unwrap(),
-                    Regex::new(r"(?:ctx\.)?provider\.exec\s*\(").unwrap(),
-                    Regex::new(r"TableStore::(?:query|exec)\s*\(").unwrap(),
-                ],
-            },
-        ];
+/// Extract provider trait bounds from `syn::Generics` (inline + where clause).
+fn extract_provider_bounds(generics: &syn::Generics) -> HashSet<String> {
+    let mut bounds = HashSet::new();
 
-        Self {
-            handler_impl_re: Regex::new(
-                r"impl\s*<\s*P\s*(?::\s*([^>]+))?\s*>\s*Handler\s*<\s*P\s*>\s*for\s+(\w+)",
-            )
-            .unwrap(),
-            bounds_re: Regex::new(r"(\w+)(?:\s*\+\s*|\s*,|\s*$)").unwrap(),
-            where_bounds_re: Regex::new(r"(?s)where\s+P\s*:\s*([^{]+?)\s*\{").unwrap(),
-            trait_method_patterns,
-            fn_with_provider_re: Regex::new(
-                r"(?:pub\s+)?async\s+fn\s+(\w+)\s*<\s*P\s*(?::\s*([^>]+))?\s*>\s*\([^)]*(?:provider|ctx)[^)]*\)"
-            ).unwrap(),
-            // Match function calls like: function_name(, function_name::<Type>(, self.method(
-            // Captures the function/method name
-            function_call_re: Regex::new(
-                r"(?:^|[^a-zA-Z_])([a-z_][a-z0-9_]*)\s*(?:::<[^>]*>)?\s*\("
-            ).unwrap(),
+    for param in &generics.params {
+        if let syn::GenericParam::Type(type_param) = param {
+            for bound in &type_param.bounds {
+                if let syn::TypeParamBound::Trait(trait_bound) = bound {
+                    let name = last_segment_name(&trait_bound.path);
+                    if is_provider_trait(&name) {
+                        bounds.insert(name);
+                    }
+                }
+            }
         }
     }
 
-    /// Perform semantic analysis on the given content.
-    pub fn analyze(&self, content: &str) -> SemanticAnalysisResult {
-        let mut result = SemanticAnalysisResult::default();
-
-        // First, build a map of all helper functions and their trait requirements
-        let function_map = self.build_function_map(content);
-
-        // Find all handler implementations with transitive trait resolution
-        let handlers = self.find_handler_implementations(content, &function_map);
-
-        // Analyze each handler for trait bound issues
-        for handler in &handlers {
-            // Check for unused trait bounds
-            result
-                .diagnostics
-                .extend(self.check_unused_bounds(handler, content));
-
-            // Check for missing trait bounds
-            result
-                .diagnostics
-                .extend(self.check_missing_bounds(handler, content));
+    if let Some(where_clause) = &generics.where_clause {
+        for predicate in &where_clause.predicates {
+            if let syn::WherePredicate::Type(pred) = predicate {
+                for bound in &pred.bounds {
+                    if let syn::TypeParamBound::Trait(trait_bound) = bound {
+                        let name = last_segment_name(&trait_bound.path);
+                        if is_provider_trait(&name) {
+                            bounds.insert(name);
+                        }
+                    }
+                }
+            }
         }
-
-        result.handlers = handlers;
-
-        // Collect all trait usages
-        result.trait_usages = self.collect_trait_usages(content);
-
-        // Add diagnostics for trait usage patterns
-        result
-            .diagnostics
-            .extend(self.analyze_trait_patterns(content));
-
-        result
     }
 
-    /// Find all Handler implementations in the content.
-    fn find_handler_implementations(
-        &self,
-        content: &str,
-        function_map: &HashMap<String, FunctionInfo>,
-    ) -> Vec<HandlerInfo> {
-        let mut handlers = Vec::new();
-        let lines: Vec<&str> = content.lines().collect();
+    bounds
+}
 
-        for (line_idx, line) in lines.iter().enumerate() {
-            if let Some(caps) = self.handler_impl_re.captures(line) {
-                let request_type = caps
-                    .get(2)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default();
+/// Extract a simple type name from `syn::Type` (handles `Path` types like `MyRequest`).
+fn type_name(ty: &syn::Type) -> String {
+    match ty {
+        syn::Type::Path(tp) => last_segment_name(&tp.path),
+        _ => String::new(),
+    }
+}
 
-                let mut declared_bounds = HashSet::new();
+/// Check if an expression refers to `provider` or `ctx.provider`.
+fn is_provider_receiver(expr: &Expr) -> bool {
+    match expr {
+        Expr::Path(ExprPath { path, .. }) => {
+            path.segments.len() == 1 && path.segments[0].ident == "provider"
+        }
+        Expr::Field(ExprField { base, member, .. }) => {
+            if let syn::Member::Named(ident) = member
+                && ident == "provider"
+                && let Expr::Path(ExprPath { path, .. }) = base.as_ref()
+            {
+                return path.segments.len() == 1 && path.segments[0].ident == "ctx";
+            }
+            false
+        }
+        // Handle &provider and &ctx.provider
+        Expr::Reference(r) => is_provider_receiver(&r.expr),
+        _ => false,
+    }
+}
 
-                // Check inline bounds
-                if let Some(bounds_match) = caps.get(1) {
-                    for bound_cap in self.bounds_re.captures_iter(bounds_match.as_str()) {
-                        if let Some(bound) = bound_cap.get(1) {
-                            let bound_name = bound.as_str();
-                            if self.is_provider_trait(bound_name) {
-                                declared_bounds.insert(bound_name.to_string());
-                            }
-                        }
-                    }
-                }
+/// Check if a method call expression is wrapped in `.await`.
+/// In syn, `expr.await` is `ExprAwait { base: expr }`.
+/// We check the parent context by looking at the call site instead.
+/// Since we can't see the parent from the child during Visit, we detect
+/// `.await` by checking if the method call is the base of an ExprAwait
+/// that we track separately.
+///
+/// Instead, for StateStore vs Config disambiguation, we check whether the
+/// method call appears inside an `.await` by scanning the impl block's content
+/// textually for the specific pattern. This is a pragmatic hybrid approach.
+fn method_to_trait(method: &str) -> Option<&'static str> {
+    match method {
+        "fetch" => Some("HttpRequest"),
+        "send" => Some("Publisher"),
+        "set" | "delete" => Some("StateStore"),
+        "access_token" => Some("Identity"),
+        "query" | "exec" => Some("TableStore"),
+        _ => None,
+    }
+}
 
-                // Look for where clause
-                let context_lines: String = lines
-                    .iter()
-                    .skip(line_idx)
-                    .take(10)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n");
+/// Visitor that walks expression trees to detect provider trait usage
+/// and function calls for transitive resolution.
+#[derive(Default)]
+struct TraitUsageVisitor {
+    used_traits: HashSet<String>,
+    called_functions: HashSet<String>,
+    trait_usages: Vec<TraitUsage>,
+    /// Track expressions that are the base of an `.await`.
+    /// We collect awaited method calls to disambiguate `provider.get` (Config vs StateStore).
+    awaited_spans: HashSet<(usize, usize)>,
+}
 
-                if let Some(where_caps) = self.where_bounds_re.captures(&context_lines) {
-                    if let Some(where_bounds) = where_caps.get(1) {
-                        for bound_cap in self.bounds_re.captures_iter(where_bounds.as_str()) {
-                            if let Some(bound) = bound_cap.get(1) {
-                                let bound_name = bound.as_str();
-                                if self.is_provider_trait(bound_name) {
-                                    declared_bounds.insert(bound_name.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
+impl TraitUsageVisitor {
+    /// First pass: collect all spans that are inside `.await` expressions.
+    fn collect_awaited_spans(&mut self, items: &[syn::ImplItem]) {
+        struct AwaitCollector {
+            spans: HashSet<(usize, usize)>,
+        }
+        impl<'ast> Visit<'ast> for AwaitCollector {
+            fn visit_expr_await(&mut self, node: &'ast ExprAwait) {
+                let start = node.base.span().start();
+                let end = node.base.span().end();
+                self.spans.insert((start.line, start.column));
+                let _ = end; // use start as the unique key
+                syn::visit::visit_expr_await(self, node);
+            }
+        }
+        let mut collector = AwaitCollector {
+            spans: HashSet::new(),
+        };
+        for item in items {
+            collector.visit_impl_item(item);
+        }
+        self.awaited_spans = collector.spans;
+    }
 
-                // Find the end of the impl block
-                let impl_end = self.find_impl_block_end(&lines, line_idx);
+    fn collect_awaited_spans_from_block(&mut self, block: &syn::Block) {
+        struct AwaitCollector {
+            spans: HashSet<(usize, usize)>,
+        }
+        impl<'ast> Visit<'ast> for AwaitCollector {
+            fn visit_expr_await(&mut self, node: &'ast ExprAwait) {
+                let start = node.base.span().start();
+                self.spans.insert((start.line, start.column));
+                syn::visit::visit_expr_await(self, node);
+            }
+        }
+        let mut collector = AwaitCollector {
+            spans: HashSet::new(),
+        };
+        collector.visit_block(block);
+        self.awaited_spans = collector.spans;
+    }
 
-                // Extract the impl block content
-                let impl_content: String = lines
-                    .iter()
-                    .skip(line_idx)
-                    .take(impl_end - line_idx + 1)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n");
+    fn is_awaited(&self, expr: &Expr) -> bool {
+        let start = expr.span().start();
+        self.awaited_spans.contains(&(start.line, start.column))
+    }
+}
 
-                // Detect directly used traits
-                let direct_trait_usage = self.detect_trait_usage(&impl_content);
+impl<'ast> Visit<'ast> for TraitUsageVisitor {
+    fn visit_expr_method_call(&mut self, call: &'ast ExprMethodCall) {
+        let method = call.method.to_string();
 
-                // Detect function calls within the handler
-                let called_functions = self.detect_function_calls(&impl_content);
+        if is_provider_receiver(&call.receiver) {
+            let line = call.method.span().start().line.saturating_sub(1);
+            let col_start = call.method.span().start().column;
+            let col_end = call.method.span().end().column;
 
-                // Resolve transitive trait usage through function delegation
-                let used_traits =
-                    self.resolve_transitive_traits(&direct_trait_usage, &called_functions, function_map);
-
-                handlers.push(HandlerInfo {
-                    request_type,
-                    impl_line: line_idx,
-                    declared_bounds,
-                    used_traits,
-                    direct_trait_usage,
-                    called_functions,
-                    line_range: (line_idx, impl_end),
+            if method == "get" {
+                // Disambiguate Config vs StateStore: .get(...).await -> StateStore
+                let trait_name =
+                    if self.is_awaited(&Expr::MethodCall(call.clone())) {
+                        "StateStore"
+                    } else {
+                        "Config"
+                    };
+                self.used_traits.insert(trait_name.to_string());
+                self.trait_usages.push(TraitUsage {
+                    trait_name: trait_name.to_string(),
+                    method: "get".to_string(),
+                    line,
+                    col_range: (col_start, col_end),
+                });
+            } else if let Some(trait_name) = method_to_trait(&method) {
+                self.used_traits.insert(trait_name.to_string());
+                self.trait_usages.push(TraitUsage {
+                    trait_name: trait_name.to_string(),
+                    method: method.clone(),
+                    line,
+                    col_range: (col_start, col_end),
                 });
             }
         }
 
-        handlers
+        syn::visit::visit_expr_method_call(self, call);
     }
 
-    /// Check if a name is a known provider trait.
-    fn is_provider_trait(&self, name: &str) -> bool {
-        matches!(
-            name,
-            "Config" | "HttpRequest" | "Publisher" | "StateStore" | "Identity" | "TableStore"
-        )
-    }
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let Expr::Path(ExprPath { path, .. }) = call.func.as_ref() {
+            let segments: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
 
-    /// Find the end of an impl block by counting braces.
-    fn find_impl_block_end(&self, lines: &[&str], start_line: usize) -> usize {
-        let mut brace_count = 0;
-        let mut found_first_brace = false;
-
-        for (idx, line) in lines.iter().enumerate().skip(start_line) {
-            for ch in line.chars() {
-                if ch == '{' {
-                    brace_count += 1;
-                    found_first_brace = true;
-                } else if ch == '}' {
-                    brace_count -= 1;
-                    if found_first_brace && brace_count == 0 {
-                        return idx;
-                    }
+            // UFCS calls: Config::get(provider, ...), HttpRequest::fetch(provider, ...) etc.
+            if segments.len() >= 2 {
+                let type_name = &segments[segments.len() - 2];
+                let method_name = &segments[segments.len() - 1];
+                if is_provider_trait(type_name) {
+                    let line = path.span().start().line.saturating_sub(1);
+                    let col_start = path.span().start().column;
+                    let col_end = path.span().end().column;
+                    self.used_traits.insert(type_name.clone());
+                    self.trait_usages.push(TraitUsage {
+                        trait_name: type_name.clone(),
+                        method: method_name.clone(),
+                        line,
+                        col_range: (col_start, col_end),
+                    });
                 }
+            }
+
+            // Single-segment function calls for transitive resolution
+            if segments.len() == 1 {
+                self.called_functions.insert(segments[0].clone());
             }
         }
 
-        lines.len().saturating_sub(1)
+        syn::visit::visit_expr_call(self, call);
+    }
+}
+
+/// Extract all Handler implementations from a parsed file.
+fn extract_handlers(
+    file: &syn::File, function_map: &HashMap<String, FunctionInfo>,
+) -> Vec<HandlerInfo> {
+    let mut handlers = Vec::new();
+
+    for item in &file.items {
+        let Item::Impl(impl_block) = item else {
+            continue;
+        };
+
+        // Check if this implements a trait ending in "Handler"
+        let Some((_, trait_path, _)) = &impl_block.trait_ else {
+            continue;
+        };
+        if last_segment_name(trait_path) != "Handler" {
+            continue;
+        }
+
+        let request_type = type_name(&impl_block.self_ty);
+        let declared_bounds = extract_provider_bounds(&impl_block.generics);
+
+        // Walk the impl body for trait usage and function calls
+        let mut visitor = TraitUsageVisitor::default();
+        visitor.collect_awaited_spans(&impl_block.items);
+        for impl_item in &impl_block.items {
+            visitor.visit_impl_item(impl_item);
+        }
+
+        let used_traits = resolve_transitive_traits(
+            &visitor.used_traits,
+            &visitor.called_functions,
+            function_map,
+        );
+
+        let impl_line = impl_block.impl_token.span.start().line.saturating_sub(1);
+        let end_line = impl_block
+            .brace_token
+            .span
+            .close()
+            .end()
+            .line
+            .saturating_sub(1);
+
+        handlers.push(HandlerInfo {
+            request_type,
+            impl_line,
+            declared_bounds,
+            used_traits,
+            direct_trait_usage: visitor.used_traits,
+            called_functions: visitor.called_functions,
+            line_range: (impl_line, end_line),
+        });
     }
 
-    /// Detect which provider traits are used in a code block.
-    fn detect_trait_usage(&self, content: &str) -> HashSet<String> {
-        let mut used_traits = HashSet::new();
+    handlers
+}
 
-        for pattern in &self.trait_method_patterns {
-            for regex in &pattern.patterns {
-                if regex.is_match(content) {
-                    used_traits.insert(pattern.trait_name.to_string());
-                    break;
+/// Check if a function signature has a parameter named `provider` or `ctx`.
+fn has_provider_param(sig: &syn::Signature) -> bool {
+    for arg in &sig.inputs {
+        if let syn::FnArg::Typed(pat_type) = arg
+            && let syn::Pat::Ident(pat_ident) = pat_type.pat.as_ref()
+        {
+            let name = pat_ident.ident.to_string();
+            if name == "provider" || name == "ctx" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Extract all helper functions with provider bounds from a parsed file.
+fn extract_functions(file: &syn::File) -> HashMap<String, FunctionInfo> {
+    let mut map = HashMap::new();
+
+    for item in &file.items {
+        let Item::Fn(func) = item else { continue };
+
+        let bounds = extract_provider_bounds(&func.sig.generics);
+        if bounds.is_empty() && !has_provider_param(&func.sig) {
+            continue;
+        }
+
+        let mut visitor = TraitUsageVisitor::default();
+        visitor.collect_awaited_spans_from_block(&func.block);
+        visitor.visit_block(&func.block);
+
+        let line = func.sig.fn_token.span.start().line.saturating_sub(1);
+        let end_line = func
+            .block
+            .brace_token
+            .span
+            .close()
+            .end()
+            .line
+            .saturating_sub(1);
+
+        map.insert(
+            func.sig.ident.to_string(),
+            FunctionInfo {
+                name: func.sig.ident.to_string(),
+                line,
+                declared_bounds: bounds,
+                direct_trait_usage: visitor.used_traits,
+                called_functions: visitor.called_functions,
+                line_range: (line, end_line),
+            },
+        );
+    }
+
+    map
+}
+
+/// Collect all trait usages from the AST for reporting.
+fn collect_trait_usages_from_file(file: &syn::File) -> HashMap<String, Vec<TraitUsage>> {
+    let mut visitor = TraitUsageVisitor::default();
+
+    // Collect awaited spans from all functions and impl blocks
+    for item in &file.items {
+        match item {
+            Item::Fn(func) => {
+                visitor.collect_awaited_spans_from_block(&func.block);
+            }
+            Item::Impl(impl_block) => {
+                visitor.collect_awaited_spans(&impl_block.items);
+            }
+            _ => {}
+        }
+    }
+
+    // Now visit everything
+    for item in &file.items {
+        visitor.visit_item(item);
+    }
+
+    let mut usages: HashMap<String, Vec<TraitUsage>> = HashMap::new();
+    for usage in visitor.trait_usages {
+        usages
+            .entry(usage.trait_name.clone())
+            .or_default()
+            .push(usage);
+    }
+    usages
+}
+
+// ---------------------------------------------------------------------------
+// Analysis logic (unchanged from regex era)
+// ---------------------------------------------------------------------------
+
+/// Resolve transitive trait requirements through function delegation.
+/// Traverses the call graph to find all traits that are transitively required.
+fn resolve_transitive_traits(
+    direct_usage: &HashSet<String>, called_functions: &HashSet<String>,
+    function_map: &HashMap<String, FunctionInfo>,
+) -> HashSet<String> {
+    let mut all_traits = direct_usage.clone();
+    let mut visited = HashSet::new();
+    let mut to_visit: Vec<String> = called_functions.iter().cloned().collect();
+
+    while let Some(fn_name) = to_visit.pop() {
+        if visited.contains(&fn_name) {
+            continue;
+        }
+        visited.insert(fn_name.clone());
+
+        if let Some(fn_info) = function_map.get(&fn_name) {
+            all_traits.extend(fn_info.declared_bounds.iter().cloned());
+            all_traits.extend(fn_info.direct_trait_usage.iter().cloned());
+
+            for called in &fn_info.called_functions {
+                if !visited.contains(called) {
+                    to_visit.push(called.clone());
                 }
             }
         }
-
-        used_traits
     }
 
-    /// Detect function calls within a code block.
-    /// Returns a set of function names that are called.
-    fn detect_function_calls(&self, content: &str) -> HashSet<String> {
-        let mut called_functions = HashSet::new();
+    all_traits
+}
 
-        // Skip certain built-in/common function names that aren't helper functions
-        let skip_functions: HashSet<&str> = [
-            "ok", "err", "some", "none", "unwrap", "expect", "map", "map_err",
-            "and_then", "or_else", "ok_or", "ok_or_else", "unwrap_or",
-            "unwrap_or_else", "unwrap_or_default", "as_ref", "as_mut",
-            "into", "from", "try_into", "try_from", "clone", "to_string",
-            "to_owned", "format", "println", "eprintln", "dbg", "vec",
-            "async", "await", "return", "if", "else", "match", "for", "while",
-            "loop", "break", "continue", "let", "mut", "const", "static",
-            "fn", "impl", "struct", "enum", "trait", "type", "use", "mod",
-            "pub", "self", "super", "crate", "where", "get", "set", "send",
-            "fetch", "query", "exec", "delete", "access_token", // trait methods
-        ]
-        .into_iter()
-        .collect();
+// ---------------------------------------------------------------------------
+// SemanticAnalyzer (public API)
+// ---------------------------------------------------------------------------
 
-        for cap in self.function_call_re.captures_iter(content) {
-            if let Some(fn_name) = cap.get(1) {
-                let name = fn_name.as_str();
-                // Only include if it's likely a user-defined helper function
-                if !skip_functions.contains(name) && name.len() > 1 {
-                    called_functions.insert(name.to_string());
-                }
+/// Semantic analyzer for Omnia code.
+///
+/// Uses `syn` for AST-based extraction and regex for simple text-pattern
+/// checks (StateStore TTL, Config error handling, fetch context).
+pub struct SemanticAnalyzer;
+
+impl SemanticAnalyzer {
+    /// Create a new semantic analyzer.
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Perform semantic analysis on the given content.
+    pub fn analyze(&self, content: &str) -> SemanticAnalysisResult {
+        let file = match syn::parse_file(content) {
+            Ok(f) => f,
+            Err(_) => return SemanticAnalysisResult::default(),
+        };
+
+        let mut result = SemanticAnalysisResult::default();
+
+        let function_map = extract_functions(&file);
+        let handlers = extract_handlers(&file, &function_map);
+
+        for handler in &handlers {
+            result
+                .diagnostics
+                .extend(self.check_unused_bounds(handler, content));
+            result
+                .diagnostics
+                .extend(self.check_missing_bounds(handler, content));
+
+            // Handler with no provider bounds at all
+            if handler.declared_bounds.is_empty() {
+                let lines: Vec<&str> = content.lines().collect();
+                result.diagnostics.push(Diagnostic {
+                    line: handler.impl_line + 1,
+                    column: 0,
+                    end_column: lines.get(handler.impl_line).map_or(0, |l| l.len()),
+                    severity: RuleSeverity::Warning,
+                    rule_id: "handler_missing_bounds".to_string(),
+                    rule_name: "Handler Missing Provider Bounds".to_string(),
+                    category: RuleCategory::Handler,
+                    message: "Handler implementation should specify provider trait bounds."
+                        .to_string(),
+                    fix_template: Some(
+                        "impl<P: Config + HttpRequest> Handler<P> for ...".to_string(),
+                    ),
+                    source_snippet: lines.get(handler.impl_line).map(|s| s.to_string()),
+                });
             }
         }
 
-        called_functions
-    }
+        result.handlers = handlers;
+        result.trait_usages = collect_trait_usages_from_file(&file);
 
-    /// Build a map of all helper functions with their trait requirements.
-    fn build_function_map(&self, content: &str) -> HashMap<String, FunctionInfo> {
-        let mut function_map = HashMap::new();
-        let lines: Vec<&str> = content.lines().collect();
+        // Regex-based pattern checks (pragmatic hybrid -- these scan raw text)
+        result
+            .diagnostics
+            .extend(self.analyze_trait_patterns(content, &function_map));
 
-        for (line_idx, line) in lines.iter().enumerate() {
-            if let Some(caps) = self.fn_with_provider_re.captures(line) {
-                let fn_name = caps
-                    .get(1)
-                    .map(|m| m.as_str().to_string())
-                    .unwrap_or_default();
-
-                let mut declared_bounds = HashSet::new();
-
-                // Check inline bounds
-                if let Some(bounds_match) = caps.get(2) {
-                    for bound_cap in self.bounds_re.captures_iter(bounds_match.as_str()) {
-                        if let Some(bound) = bound_cap.get(1) {
-                            let bound_name = bound.as_str();
-                            if self.is_provider_trait(bound_name) {
-                                declared_bounds.insert(bound_name.to_string());
-                            }
-                        }
-                    }
-                }
-
-                // Look for where clause
-                let context_lines: String = lines
-                    .iter()
-                    .skip(line_idx)
-                    .take(5)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                if let Some(where_caps) = self.where_bounds_re.captures(&context_lines) {
-                    if let Some(where_bounds) = where_caps.get(1) {
-                        for bound_cap in self.bounds_re.captures_iter(where_bounds.as_str()) {
-                            if let Some(bound) = bound_cap.get(1) {
-                                let bound_name = bound.as_str();
-                                if self.is_provider_trait(bound_name) {
-                                    declared_bounds.insert(bound_name.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Find function end and extract body
-                let fn_end = self.find_fn_end(&lines, line_idx);
-                let fn_content: String = lines
-                    .iter()
-                    .skip(line_idx)
-                    .take(fn_end - line_idx + 1)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                // Detect direct trait usage
-                let direct_trait_usage = self.detect_trait_usage(&fn_content);
-
-                // Detect function calls
-                let called_functions = self.detect_function_calls(&fn_content);
-
-                function_map.insert(
-                    fn_name.clone(),
-                    FunctionInfo {
-                        name: fn_name,
-                        line: line_idx,
-                        declared_bounds,
-                        direct_trait_usage,
-                        called_functions,
-                        line_range: (line_idx, fn_end),
-                    },
-                );
-            }
-        }
-
-        function_map
-    }
-
-    /// Resolve transitive trait requirements through function delegation.
-    /// This traverses the call graph to find all traits that are transitively required.
-    fn resolve_transitive_traits(
-        &self,
-        direct_usage: &HashSet<String>,
-        called_functions: &HashSet<String>,
-        function_map: &HashMap<String, FunctionInfo>,
-    ) -> HashSet<String> {
-        let mut all_traits = direct_usage.clone();
-        let mut visited = HashSet::new();
-        let mut to_visit: Vec<String> = called_functions.iter().cloned().collect();
-
-        while let Some(fn_name) = to_visit.pop() {
-            if visited.contains(&fn_name) {
-                continue;
-            }
-            visited.insert(fn_name.clone());
-
-            if let Some(fn_info) = function_map.get(&fn_name) {
-                // Add traits from the declared bounds of this function
-                // (declared bounds indicate what traits the function requires)
-                all_traits.extend(fn_info.declared_bounds.iter().cloned());
-
-                // Also add directly used traits from the function body
-                all_traits.extend(fn_info.direct_trait_usage.iter().cloned());
-
-                // Add any functions this function calls to the visit list
-                for called in &fn_info.called_functions {
-                    if !visited.contains(called) {
-                        to_visit.push(called.clone());
-                    }
-                }
-            }
-        }
-
-        all_traits
+        result
     }
 
     /// Check for unused trait bounds in a handler.
@@ -575,64 +639,40 @@ impl SemanticAnalyzer {
         diagnostics
     }
 
-    /// Collect all trait usages in the content.
-    fn collect_trait_usages(&self, content: &str) -> HashMap<String, Vec<TraitUsage>> {
-        let mut usages: HashMap<String, Vec<TraitUsage>> = HashMap::new();
-
-        for (line_idx, line) in content.lines().enumerate() {
-            for pattern in &self.trait_method_patterns {
-                for regex in &pattern.patterns {
-                    for mat in regex.find_iter(line) {
-                        let usage = TraitUsage {
-                            trait_name: pattern.trait_name.to_string(),
-                            method: "".to_string(), // Could be extracted from match
-                            line: line_idx,
-                            col_range: (mat.start(), mat.end()),
-                        };
-                        usages
-                            .entry(pattern.trait_name.to_string())
-                            .or_default()
-                            .push(usage);
-                    }
-                }
-            }
-        }
-
-        usages
-    }
-
     /// Analyze trait usage patterns for additional diagnostics.
-    fn analyze_trait_patterns(&self, content: &str) -> Vec<Diagnostic> {
+    /// Uses regex for simple text-pattern checks that don't benefit from AST parsing.
+    fn analyze_trait_patterns(
+        &self, content: &str, function_map: &HashMap<String, FunctionInfo>,
+    ) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         let lines: Vec<&str> = content.lines().collect();
 
-        // Check for Config usage without error handling
-        let config_get_re = Regex::new(r"provider\.get\s*\([^)]+\)").unwrap();
+        let config_get_re =
+            Regex::new(r"provider\.get\s*\([^)]+\)").expect("valid regex: config_get");
         for (line_idx, line) in lines.iter().enumerate() {
             if config_get_re.is_match(line)
                 && !line.contains("unwrap_or")
                 && !line.contains("ok_or")
+                && !line.contains('?')
+                && !line.contains(".await?")
             {
-                // Check if there's a ? on the same line or the config value is used with ?
-                if !line.contains('?') && !line.contains(".await?") {
-                    diagnostics.push(Diagnostic {
-                        line: line_idx + 1,
-                        column: 0,
-                        end_column: line.len(),
-                        severity: RuleSeverity::Hint,
-                        rule_id: "config_error_handling".to_string(),
-                        rule_name: "Config::get Error Handling".to_string(),
-                        category: RuleCategory::Error,
-                        message: "Config::get returns Result - consider using `?` or `.ok_or_else(|| bad_request!(\"missing config\"))?`".to_string(),
-                        fix_template: Some("Add `?` or proper error handling".to_string()),
-                        source_snippet: Some(line.to_string()),
-                    });
-                }
+                diagnostics.push(Diagnostic {
+                    line: line_idx + 1,
+                    column: 0,
+                    end_column: line.len(),
+                    severity: RuleSeverity::Hint,
+                    rule_id: "config_error_handling".to_string(),
+                    rule_name: "Config::get Error Handling".to_string(),
+                    category: RuleCategory::Error,
+                    message: "Config::get returns Result - consider using `?` or `.ok_or_else(|| bad_request!(\"missing config\"))?`".to_string(),
+                    fix_template: Some("Add `?` or proper error handling".to_string()),
+                    source_snippet: Some(line.to_string()),
+                });
             }
         }
 
-        // Check for StateStore set without TTL consideration
-        let set_no_ttl_re = Regex::new(r"provider\.set\s*\([^,]+,[^,]+,\s*None\s*\)").unwrap();
+        let set_no_ttl_re =
+            Regex::new(r"provider\.set\s*\([^,]+,[^,]+,\s*None\s*\)").expect("valid regex: set_no_ttl");
         for (line_idx, line) in lines.iter().enumerate() {
             if set_no_ttl_re.is_match(line) {
                 diagnostics.push(Diagnostic {
@@ -650,8 +690,8 @@ impl SemanticAnalyzer {
             }
         }
 
-        // Check for HttpRequest fetch without proper error context
-        let fetch_re = Regex::new(r"provider\.fetch\s*\([^)]+\)\.await\?").unwrap();
+        let fetch_re =
+            Regex::new(r"provider\.fetch\s*\([^)]+\)\.await\?").expect("valid regex: fetch_context");
         for (line_idx, line) in lines.iter().enumerate() {
             if fetch_re.is_match(line) && !line.contains(".context(") {
                 diagnostics.push(Diagnostic {
@@ -669,33 +709,27 @@ impl SemanticAnalyzer {
             }
         }
 
-        // Check helper functions for proper trait bounds (with transitive resolution)
-        let function_map = self.build_function_map(content);
-        self.check_function_trait_bounds(content, &function_map, &mut diagnostics);
+        self.check_function_trait_bounds(content, function_map, &mut diagnostics);
 
         diagnostics
     }
 
     /// Check helper functions for proper trait bounds.
     fn check_function_trait_bounds(
-        &self,
-        content: &str,
-        function_map: &HashMap<String, FunctionInfo>,
+        &self, content: &str, function_map: &HashMap<String, FunctionInfo>,
         diagnostics: &mut Vec<Diagnostic>,
     ) {
         let lines: Vec<&str> = content.lines().collect();
 
         for fn_info in function_map.values() {
-            let line = lines.get(fn_info.line).map(|s| *s).unwrap_or("");
+            let line = lines.get(fn_info.line).copied().unwrap_or("");
 
-            // Resolve transitive trait usage for this function
-            let used_traits = self.resolve_transitive_traits(
+            let used_traits = resolve_transitive_traits(
                 &fn_info.direct_trait_usage,
                 &fn_info.called_functions,
                 function_map,
             );
 
-            // Report unused bounds in helper functions
             for declared in &fn_info.declared_bounds {
                 if !used_traits.contains(declared) {
                     diagnostics.push(Diagnostic {
@@ -716,7 +750,6 @@ impl SemanticAnalyzer {
                 }
             }
 
-            // Report missing bounds in helper functions
             for used in &used_traits {
                 if !fn_info.declared_bounds.contains(used) && !fn_info.declared_bounds.is_empty() {
                     diagnostics.push(Diagnostic {
@@ -737,28 +770,6 @@ impl SemanticAnalyzer {
                 }
             }
         }
-    }
-
-    /// Find the end of a function by counting braces.
-    fn find_fn_end(&self, lines: &[&str], start_line: usize) -> usize {
-        let mut brace_count = 0;
-        let mut found_first_brace = false;
-
-        for (idx, line) in lines.iter().enumerate().skip(start_line) {
-            for ch in line.chars() {
-                if ch == '{' {
-                    brace_count += 1;
-                    found_first_brace = true;
-                } else if ch == '}' {
-                    brace_count -= 1;
-                    if found_first_brace && brace_count == 0 {
-                        return idx;
-                    }
-                }
-            }
-        }
-
-        lines.len().saturating_sub(1)
     }
 }
 
@@ -816,12 +827,8 @@ impl<P: Config + HttpRequest + Publisher> Handler<P> for MyRequest {
 "#;
         let result = analyzer.analyze(content);
 
-        // Should have warnings for unused HttpRequest and Publisher
-        let unused_warnings: Vec<_> = result
-            .diagnostics
-            .iter()
-            .filter(|d| d.rule_id == "unused_provider_bound")
-            .collect();
+        let unused_warnings: Vec<_> =
+            result.diagnostics.iter().filter(|d| d.rule_id == "unused_provider_bound").collect();
 
         assert!(unused_warnings.len() >= 1);
     }
@@ -839,12 +846,8 @@ impl<P: Config> Handler<P> for CacheRequest {
 "#;
         let result = analyzer.analyze(content);
 
-        // Should have an error for missing StateStore bound
-        let missing_errors: Vec<_> = result
-            .diagnostics
-            .iter()
-            .filter(|d| d.rule_id == "missing_provider_bound")
-            .collect();
+        let missing_errors: Vec<_> =
+            result.diagnostics.iter().filter(|d| d.rule_id == "missing_provider_bound").collect();
 
         assert!(missing_errors.len() >= 1);
     }
@@ -852,10 +855,7 @@ impl<P: Config> Handler<P> for CacheRequest {
     #[test]
     fn test_transitive_trait_detection_via_function_delegation() {
         let analyzer = SemanticAnalyzer::new();
-        // Handler calls fetch_data which requires HttpRequest
-        // HttpRequest should NOT be marked as unused
         let content = r#"
-// Helper function that uses HttpRequest
 async fn fetch_data<P: HttpRequest>(provider: &P, url: &str) -> Result<Response> {
     provider.fetch(url).await
 }
@@ -863,7 +863,6 @@ async fn fetch_data<P: HttpRequest>(provider: &P, url: &str) -> Result<Response>
 impl<P: Config + HttpRequest> Handler<P> for DelegatingRequest {
     async fn handle(self, ctx: Context<'_, P>) -> Result<Reply<Self::Output>> {
         let url = ctx.provider.get("API_URL")?;
-        // Delegates to helper - HttpRequest is used transitively
         let response = fetch_data(&ctx.provider, &url).await?;
         Ok(Reply::ok(response))
     }
@@ -873,13 +872,11 @@ impl<P: Config + HttpRequest> Handler<P> for DelegatingRequest {
 
         let handler = &result.handlers[0];
 
-        // HttpRequest should be detected as transitively used
         assert!(
             handler.used_traits.contains("HttpRequest"),
             "HttpRequest should be detected via transitive delegation to fetch_data"
         );
 
-        // There should be NO unused warnings for HttpRequest
         let unused_http: Vec<_> = result
             .diagnostics
             .iter()
@@ -896,14 +893,11 @@ impl<P: Config + HttpRequest> Handler<P> for DelegatingRequest {
     #[test]
     fn test_transitive_trait_detection_chain() {
         let analyzer = SemanticAnalyzer::new();
-        // Tests a chain: handler -> helper1 -> helper2 (which uses the trait)
         let content = r#"
-// Inner helper that uses Publisher
 async fn send_notification<P: Publisher>(provider: &P, msg: &str) -> Result<()> {
     provider.send(msg).await
 }
 
-// Outer helper that delegates to inner
 async fn notify_users<P: Publisher>(provider: &P) -> Result<()> {
     send_notification(provider, "Hello").await
 }
@@ -920,13 +914,11 @@ impl<P: Config + Publisher> Handler<P> for ChainedRequest {
 
         let handler = &result.handlers[0];
 
-        // Publisher should be detected through the chain
         assert!(
             handler.used_traits.contains("Publisher"),
             "Publisher should be detected via chained delegation: notify_users -> send_notification"
         );
 
-        // No unused warnings for Publisher
         let unused_pub: Vec<_> = result
             .diagnostics
             .iter()
@@ -936,6 +928,86 @@ impl<P: Config + Publisher> Handler<P> for ChainedRequest {
         assert!(
             unused_pub.is_empty(),
             "Publisher should not be flagged as unused when used in delegation chain"
+        );
+    }
+
+    #[test]
+    fn test_analyze_statestore_no_ttl() {
+        let analyzer = SemanticAnalyzer::new();
+        let content = r#"
+async fn cache_it<P: StateStore>(provider: &P) -> Result<()> {
+    provider.set("key", b"value", None).await?;
+    Ok(())
+}
+"#;
+        let result = analyzer.analyze(content);
+        let ttl_warnings: Vec<_> =
+            result.diagnostics.iter().filter(|d| d.rule_id == "statestore_no_ttl").collect();
+        assert!(
+            !ttl_warnings.is_empty(),
+            "Should warn about StateStore::set with None TTL"
+        );
+    }
+
+    #[test]
+    fn test_extract_provider_bounds_inline() {
+        let generics: syn::Generics = syn::parse_str("< P : Config + HttpRequest >").unwrap();
+        let bounds = extract_provider_bounds(&generics);
+        assert!(bounds.contains("Config"));
+        assert!(bounds.contains("HttpRequest"));
+        assert_eq!(bounds.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_provider_bounds_where_clause() {
+        let item: syn::ItemFn = syn::parse_str(
+            "fn foo<P>() where P: Config + StateStore {}",
+        )
+        .unwrap();
+        let bounds = extract_provider_bounds(&item.sig.generics);
+        assert!(bounds.contains("Config"));
+        assert!(bounds.contains("StateStore"));
+    }
+
+    #[test]
+    fn test_extract_provider_bounds_filters_non_provider() {
+        let generics: syn::Generics =
+            syn::parse_str("< P : Config + Send + Sync + Debug >").unwrap();
+        let bounds = extract_provider_bounds(&generics);
+        assert!(bounds.contains("Config"));
+        assert!(!bounds.contains("Send"));
+        assert!(!bounds.contains("Debug"));
+        assert_eq!(bounds.len(), 1);
+    }
+
+    #[test]
+    fn test_graceful_fallback_on_invalid_syntax() {
+        let analyzer = SemanticAnalyzer::new();
+        let content = "this is not valid rust {{{{";
+        let result = analyzer.analyze(content);
+        assert!(result.handlers.is_empty());
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn test_handler_missing_bounds_diagnostic() {
+        let analyzer = SemanticAnalyzer::new();
+        let content = r#"
+impl<P> Handler<P> for NoBoundsRequest {
+    async fn handle(self, ctx: Context<'_, P>) -> Result<Reply<Self::Output>> {
+        Ok(Reply::ok(()))
+    }
+}
+"#;
+        let result = analyzer.analyze(content);
+        let missing: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.rule_id == "handler_missing_bounds")
+            .collect();
+        assert!(
+            !missing.is_empty(),
+            "Should warn about handler with no provider bounds"
         );
     }
 }

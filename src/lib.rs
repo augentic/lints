@@ -1,13 +1,13 @@
-//! QWASR Lint - A custom Rust linter for QWASR WASM32 handler development.
+//! Omnia Lint - A custom Rust linter for Omnia guest development.
 //!
 //! This crate provides linting rules and analysis for Rust code targeting
-//! WASM32 handlers with the QWASR framework. It enforces best practices,
+//! WASM32 handlers with the Omnia framework. It enforces best practices,
 //! detects forbidden patterns, and validates Handler implementations.
 //!
 //! # Usage
 //!
 //! ```rust,no_run
-//! use qwasr_lint::{Linter, LintConfig};
+//! use omnia_lint::{LintConfig, Linter};
 //!
 //! let linter = Linter::new(LintConfig::default());
 //! let diagnostics = linter.lint_file("src/handler.rs").unwrap();
@@ -24,14 +24,12 @@ pub mod output;
 pub mod rules;
 pub mod semantic;
 
-pub use config::CargoLintConfig;
-pub use diagnostics::{
-    parse_ignore_directives, Diagnostic, DiagnosticsEngine, IgnoreDirective, Severity,
-};
-pub use rules::{LintLevel, Rule, RuleCategory, RuleSet, RuleSeverity};
+use std::path::Path;
 
 use anyhow::Result;
-use std::path::Path;
+pub use config::CargoLintConfig;
+pub use diagnostics::{Diagnostic, DiagnosticsEngine, IgnoreDirective, parse_ignore_directives};
+pub use rules::{LintLevel, Rule, RuleCategory, RuleSet, RuleSeverity};
 
 /// Configuration for the linter.
 #[derive(Debug, Clone)]
@@ -51,7 +49,7 @@ pub struct LintConfig {
     /// Whether to include fix suggestions in output.
     pub show_fixes: bool,
 
-    /// Cargo.toml-based severity overrides (populated from `[lints.qwasr]`).
+    /// Cargo.toml-based severity overrides (populated from `[lints.omnia]`).
     pub cargo_overrides: CargoLintConfig,
 }
 
@@ -104,19 +102,13 @@ impl Linter {
         diagnostics
             .into_iter()
             .filter_map(|mut d| {
-                // Apply Cargo.toml severity overrides first
-                if !self.config.cargo_overrides.is_empty() {
-                    if let Some(level) = self
-                        .config
-                        .cargo_overrides
-                        .effective_level(&d.rule_id, d.category)
-                    {
-                        match level.to_severity() {
-                            // `allow` → suppress entirely
-                            None => return None,
-                            // Override the severity
-                            Some(sev) => d.severity = sev,
-                        }
+                if !self.config.cargo_overrides.is_empty()
+                    && let Some(level) =
+                        self.config.cargo_overrides.effective_level(&d.rule_id, d.category)
+                {
+                    match level.to_severity() {
+                        None => return None,
+                        Some(sev) => d.severity = sev,
                     }
                 }
 
