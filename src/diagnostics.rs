@@ -1,11 +1,11 @@
-//! Diagnostics engine for analyzing QWASR code.
+//! Diagnostics engine for analyzing Omnia code.
 
 use std::collections::HashSet;
 use std::path::Path;
 
 use regex::Regex;
 
-use crate::constraints::{ForbiddenPattern, QwasrContext, Severity as ConstraintSeverity};
+use crate::constraints::{ForbiddenPattern, OmniaContext};
 use crate::rules::{RuleCategory, RuleSet, RuleSeverity};
 use crate::semantic::SemanticAnalyzer;
 
@@ -31,27 +31,25 @@ impl IgnoreDirective {
 }
 
 /// Parse ignore directives from source code.
-/// 
+///
 /// Supports:
-/// - `#[qwasr::allow(all)]` - ignore all rules for the next item
-/// - `#[qwasr::allow(rule_id)]` - ignore specific rule for the next item
-/// - `#[qwasr::allow(rule1, rule2)]` - ignore multiple rules for the next item
-/// - `#![qwasr::allow(...)]` - file-level ignore (inner attribute)
+/// - `#[omnia::allow(all)]` - ignore all rules for the next item
+/// - `#[omnia::allow(rule_id)]` - ignore specific rule for the next item
+/// - `#[omnia::allow(rule1, rule2)]` - ignore multiple rules for the next item
+/// - `#![omnia::allow(...)]` - file-level ignore (inner attribute)
 pub fn parse_ignore_directives(content: &str) -> Vec<IgnoreDirective> {
     let mut directives = Vec::new();
-    
-    // Pattern for #[qwasr::allow(...)] or #![qwasr::allow(...)]
-    let attr_pattern = Regex::new(
-        r#"#(!?)\[qwasr::allow\(([^)]+)\)\]"#
-    ).unwrap();
-    
+
+    // Pattern for #[omnia::allow(...)] or #![omnia::allow(...)]
+    let attr_pattern = Regex::new(r#"#(!?)\[omnia::allow\(([^)]+)\)\]"#).unwrap();
+
     for (line_idx, line) in content.lines().enumerate() {
         let trimmed = line.trim();
-        
+
         if let Some(caps) = attr_pattern.captures(trimmed) {
-            let is_file_level = caps.get(1).map_or(false, |m| m.as_str() == "!");
+            let is_file_level = caps.get(1).is_some_and(|m| m.as_str() == "!");
             let rules_str = caps.get(2).map_or("", |m| m.as_str());
-            
+
             let rules = if rules_str.trim().to_lowercase() == "all" {
                 None
             } else {
@@ -62,7 +60,7 @@ pub fn parse_ignore_directives(content: &str) -> Vec<IgnoreDirective> {
                     .collect();
                 Some(rule_set)
             };
-            
+
             directives.push(IgnoreDirective {
                 line: line_idx + 1,
                 is_file_level,
@@ -70,29 +68,27 @@ pub fn parse_ignore_directives(content: &str) -> Vec<IgnoreDirective> {
             });
         }
     }
-    
+
     directives
 }
 
 /// Check if a diagnostic should be ignored based on directives.
 fn should_ignore_diagnostic(
-    diagnostic_line: usize,
-    rule_id: &str,
-    directives: &[IgnoreDirective],
+    diagnostic_line: usize, rule_id: &str, directives: &[IgnoreDirective],
 ) -> bool {
     for directive in directives {
         // File-level directives apply to everything
         if directive.is_file_level && directive.allows(rule_id) {
             return true;
         }
-        
+
         // Line-level directives apply to the next non-attribute line
         // We check if the directive is on the line immediately before the diagnostic
         // or within a few lines before (to handle multiple stacked attributes)
-        if !directive.is_file_level 
-            && directive.line < diagnostic_line 
+        if !directive.is_file_level
+            && directive.line < diagnostic_line
             && diagnostic_line <= directive.line + 10  // Allow up to 10 lines of attributes
-            && directive.allows(rule_id) 
+            && directive.allows(rule_id)
         {
             return true;
         }
@@ -134,9 +130,6 @@ pub struct Diagnostic {
     pub source_snippet: Option<String>,
 }
 
-/// Severity levels for diagnostics.
-pub use crate::rules::RuleSeverity as Severity;
-
 impl std::fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -147,12 +140,12 @@ impl std::fmt::Display for Diagnostic {
     }
 }
 
-/// Diagnostics engine for QWASR code analysis.
+/// Diagnostics engine for Omnia code analysis.
 pub struct DiagnosticsEngine {
-    /// QWASR context with patterns and rules.
-    context: QwasrContext,
+    /// Omnia context with patterns and rules.
+    context: OmniaContext,
 
-    /// Comprehensive rule set for QWASR validation.
+    /// Comprehensive rule set for Omnia validation.
     rule_set: RuleSet,
 
     /// Compiled regex patterns for forbidden patterns.
@@ -260,17 +253,13 @@ fn calculate_byte_offset(content: &str, line_idx: usize, col: usize) -> usize {
 impl DiagnosticsEngine {
     /// Create a new diagnostics engine.
     pub fn new() -> Self {
-        let context = QwasrContext::new();
+        let context = OmniaContext::new();
 
         let compiled_patterns: Vec<(ForbiddenPattern, Vec<Regex>)> = context
             .forbidden_patterns
             .iter()
             .map(|fp| {
-                let regexes = fp
-                    .patterns
-                    .iter()
-                    .filter_map(|p| Regex::new(p).ok())
-                    .collect();
+                let regexes = fp.patterns.iter().filter_map(|p| Regex::new(p).ok()).collect();
                 (fp.clone(), regexes)
             })
             .collect();
@@ -292,7 +281,7 @@ impl DiagnosticsEngine {
         let mut diagnostics = Vec::new();
 
         // Only analyze Rust files
-        if !path.extension().map_or(false, |ext| ext == "rs") {
+        if path.extension().is_none_or(|ext| ext != "rs") {
             return diagnostics;
         }
 
@@ -362,10 +351,7 @@ impl DiagnosticsEngine {
             diagnostics.extend(self.check_rules(content, line, line_idx));
         }
 
-        // Check for Handler implementation issues
-        diagnostics.extend(self.check_handler_implementations(content));
-
-        // Perform semantic analysis
+        // Perform semantic analysis (includes handler implementation checks)
         let semantic_result = self.semantic_analyzer.analyze(content);
         diagnostics.extend(semantic_result.diagnostics);
 
@@ -380,33 +366,32 @@ impl DiagnosticsEngine {
         let mut diagnostics = Vec::new();
 
         for rule in &self.rule_set.rules {
-            // Only check anti-patterns (violations)
-            if rule.is_anti_pattern {
-                if let Some(mat) = rule.pattern.find(line) {
-                    let byte_offset = calculate_byte_offset(content, line_idx, mat.start());
-                    if is_inside_string_literal_at_offset(content, byte_offset) {
-                        continue;
-                    }
-
-                    let message = if let Some(fix) = rule.fix_template {
-                        format!("{}\n\nSuggested fix: {}", rule.description, fix)
-                    } else {
-                        rule.description.to_string()
-                    };
-
-                    diagnostics.push(Diagnostic {
-                        line: line_idx + 1,
-                        column: mat.start(),
-                        end_column: mat.end(),
-                        severity: rule.severity,
-                        rule_id: rule.id.to_string(),
-                        rule_name: rule.name.to_string(),
-                        category: rule.category,
-                        message,
-                        fix_template: rule.fix_template.map(String::from),
-                        source_snippet: Some(line.to_string()),
-                    });
+            if rule.is_anti_pattern
+                && let Some(mat) = rule.pattern.find(line)
+            {
+                let byte_offset = calculate_byte_offset(content, line_idx, mat.start());
+                if is_inside_string_literal_at_offset(content, byte_offset) {
+                    continue;
                 }
+
+                let message = if let Some(fix) = rule.fix_template {
+                    format!("{}\n\nSuggested fix: {}", rule.description, fix)
+                } else {
+                    rule.description.to_string()
+                };
+
+                diagnostics.push(Diagnostic {
+                    line: line_idx + 1,
+                    column: mat.start(),
+                    end_column: mat.end(),
+                    severity: rule.severity,
+                    rule_id: rule.id.to_string(),
+                    rule_name: rule.name.to_string(),
+                    category: rule.category,
+                    message,
+                    fix_template: rule.fix_template.map(String::from),
+                    source_snippet: Some(line.to_string()),
+                });
             }
         }
 
@@ -415,24 +400,13 @@ impl DiagnosticsEngine {
 
     /// Create a diagnostic for a forbidden pattern.
     fn create_forbidden_pattern_diagnostic(
-        &self,
-        line_idx: usize,
-        start: usize,
-        end: usize,
-        pattern: &ForbiddenPattern,
-        line: &str,
+        &self, line_idx: usize, start: usize, end: usize, pattern: &ForbiddenPattern, line: &str,
     ) -> Diagnostic {
-        let severity = match pattern.severity {
-            ConstraintSeverity::Error => RuleSeverity::Error,
-            ConstraintSeverity::Warning => RuleSeverity::Warning,
-            ConstraintSeverity::Hint => RuleSeverity::Hint,
-        };
-
         Diagnostic {
             line: line_idx + 1,
             column: start,
             end_column: end,
-            severity,
+            severity: pattern.severity,
             rule_id: pattern.id.to_string(),
             rule_name: pattern.name.to_string(),
             category: RuleCategory::Wasm,
@@ -444,12 +418,7 @@ impl DiagnosticsEngine {
 
     /// Create a diagnostic for a forbidden crate.
     fn create_forbidden_crate_diagnostic(
-        &self,
-        line_idx: usize,
-        start: usize,
-        end: usize,
-        crate_name: &str,
-        line: &str,
+        &self, line_idx: usize, start: usize, end: usize, crate_name: &str, line: &str,
     ) -> Diagnostic {
         let alternative = get_crate_alternative(crate_name);
 
@@ -470,41 +439,6 @@ impl DiagnosticsEngine {
         }
     }
 
-    /// Check Handler implementations for common issues.
-    fn check_handler_implementations(&self, content: &str) -> Vec<Diagnostic> {
-        let mut diagnostics = Vec::new();
-
-        let handler_impl_re =
-            Regex::new(r"impl\s*<\s*P\s*(?::\s*([^>]+))?\s*>\s*Handler\s*<\s*P\s*>\s*for\s+(\w+)")
-                .unwrap();
-
-        let lines: Vec<&str> = content.lines().collect();
-
-        for (line_idx, line) in lines.iter().enumerate() {
-            if let Some(caps) = handler_impl_re.captures(line) {
-                // Check if there are bounds
-                if caps.get(1).is_none() {
-                    diagnostics.push(Diagnostic {
-                        line: line_idx + 1,
-                        column: 0,
-                        end_column: line.len(),
-                        severity: RuleSeverity::Warning,
-                        rule_id: "handler_missing_bounds".to_string(),
-                        rule_name: "Handler Missing Provider Bounds".to_string(),
-                        category: RuleCategory::Handler,
-                        message: "Handler implementation should specify provider trait bounds."
-                            .to_string(),
-                        fix_template: Some(
-                            "impl<P: Config + HttpRequest> Handler<P> for ...".to_string(),
-                        ),
-                        source_snippet: Some(line.to_string()),
-                    });
-                }
-            }
-        }
-
-        diagnostics
-    }
 }
 
 impl Default for DiagnosticsEngine {
@@ -564,9 +498,7 @@ fn main() {
 "#;
         let diagnostics = engine.analyze(content, Path::new("test.rs"));
         assert!(!diagnostics.is_empty());
-        assert!(diagnostics
-            .iter()
-            .any(|d| d.rule_id.contains("unwrap") || d.rule_id.contains("panic")));
+        assert!(diagnostics.iter().any(|d| d.rule_id == "error_generic_unwrap"));
     }
 
     #[test]
@@ -603,7 +535,7 @@ static mut COUNTER: u32 = 0;
     fn test_ignore_directive_all() {
         let engine = DiagnosticsEngine::new();
         let content = r#"
-#[qwasr::allow(all)]
+#[omnia::allow(all)]
 fn main() {
     let x = Some(5).unwrap();
 }
@@ -616,21 +548,37 @@ fn main() {
     #[test]
     fn test_ignore_directive_specific_rule() {
         let engine = DiagnosticsEngine::new();
+
+        // First verify the diagnostic fires without the ignore directive
+        let content_without_ignore = r#"
+fn main() {
+    let x = Some(5).unwrap();
+}
+"#;
+        let diags = engine.analyze(content_without_ignore, Path::new("test.rs"));
+        assert!(
+            diags.iter().any(|d| d.rule_id == "error_generic_unwrap" && d.line == 3),
+            "error_generic_unwrap should fire on .unwrap() without an ignore directive"
+        );
+
+        // Now verify the directive suppresses it
         let content = r#"
-#[qwasr::allow(unwrap_used)]
+#[omnia::allow(error_generic_unwrap)]
 fn main() {
     let x = Some(5).unwrap();
 }
 "#;
         let diagnostics = engine.analyze(content, Path::new("test.rs"));
-        // Check that unwrap_used rule is ignored
-        assert!(!diagnostics.iter().any(|d| d.rule_id == "unwrap_used" && d.line == 4));
+        assert!(
+            !diagnostics.iter().any(|d| d.rule_id == "error_generic_unwrap" && d.line == 4),
+            "error_generic_unwrap should be suppressed by #[omnia::allow(error_generic_unwrap)]"
+        );
     }
 
     #[test]
     fn test_ignore_directive_file_level() {
         let engine = DiagnosticsEngine::new();
-        let content = r#"#![qwasr::allow(all)]
+        let content = r#"#![omnia::allow(all)]
 
 fn main() {
     let x = Some(5).unwrap();
@@ -645,45 +593,100 @@ fn main() {
     #[test]
     fn test_ignore_directive_multiple_rules() {
         let engine = DiagnosticsEngine::new();
+
+        // Verify rule fires without the directive
+        let content_without_ignore = r#"
+fn main() {
+    let x = Some(5).unwrap();
+    let y = Some(6).expect("msg");
+}
+"#;
+        let diags = engine.analyze(content_without_ignore, Path::new("test.rs"));
+        assert!(
+            diags.iter().any(|d| d.rule_id == "error_generic_unwrap" && d.line == 3),
+            "error_generic_unwrap should fire on .unwrap()"
+        );
+        assert!(
+            diags.iter().any(|d| d.rule_id == "error_generic_unwrap" && d.line == 4),
+            "error_generic_unwrap should fire on .expect()"
+        );
+
+        // Now verify the directive suppresses both
         let content = r#"
-#[qwasr::allow(unwrap_used, expect_used)]
+#[omnia::allow(error_generic_unwrap)]
 fn main() {
     let x = Some(5).unwrap();
     let y = Some(6).expect("msg");
 }
 "#;
         let diagnostics = engine.analyze(content, Path::new("test.rs"));
-        // Both unwrap and expect should be ignored on lines 4-5
-        assert!(!diagnostics.iter().any(|d| 
-            (d.rule_id == "unwrap_used" || d.rule_id == "expect_used") 
-            && (d.line == 4 || d.line == 5)
-        ));
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.rule_id == "error_generic_unwrap" && (d.line == 4 || d.line == 5)),
+            "error_generic_unwrap should be suppressed for both unwrap and expect"
+        );
     }
 
     #[test]
     fn test_parse_ignore_directives() {
         let content = r#"
-#![qwasr::allow(all)]
-#[qwasr::allow(unwrap_used)]
+#![omnia::allow(all)]
+#[omnia::allow(unwrap_used)]
 fn foo() {}
-#[qwasr::allow(rule1, rule2)]
+#[omnia::allow(rule1, rule2)]
 fn bar() {}
 "#;
         let directives = parse_ignore_directives(content);
         assert_eq!(directives.len(), 3);
-        
+
         // First directive is file-level, ignores all
         assert!(directives[0].is_file_level);
         assert!(directives[0].rules.is_none());
-        
+
         // Second directive is line-level, ignores specific rule
         assert!(!directives[1].is_file_level);
         assert!(directives[1].rules.as_ref().unwrap().contains("unwrap_used"));
-        
+
         // Third directive ignores multiple rules
         assert!(!directives[2].is_file_level);
         let rules = directives[2].rules.as_ref().unwrap();
         assert!(rules.contains("rule1"));
         assert!(rules.contains("rule2"));
+    }
+
+    #[test]
+    fn test_is_inside_string_literal_regular() {
+        let content = r#"let x = "hello.unwrap()"; let y = foo.unwrap();"#;
+        // offset inside the string literal
+        let offset_in_str = content.find("hello").unwrap();
+        assert!(is_inside_string_literal_at_offset(content, offset_in_str));
+
+        // offset outside the string literal (the second unwrap)
+        let second_unwrap = content.rfind("unwrap").unwrap();
+        assert!(!is_inside_string_literal_at_offset(content, second_unwrap));
+    }
+
+    #[test]
+    fn test_is_inside_string_literal_raw_string() {
+        let content = r##"let x = r#"hello.unwrap()"#; let y = foo.unwrap();"##;
+        let in_raw = content.find("hello").unwrap();
+        assert!(is_inside_string_literal_at_offset(content, in_raw));
+    }
+
+    #[test]
+    fn test_is_inside_string_literal_comment() {
+        let content = "// let x = foo.unwrap();\nlet y = bar.unwrap();";
+        // Inside a comment line - the function skips comments
+        let in_comment = content.find("foo").unwrap();
+        assert!(!is_inside_string_literal_at_offset(content, in_comment));
+    }
+
+    #[test]
+    fn test_calculate_byte_offset() {
+        let content = "line0\nline1\nline2";
+        assert_eq!(calculate_byte_offset(content, 0, 0), 0);
+        assert_eq!(calculate_byte_offset(content, 1, 0), 6);
+        assert_eq!(calculate_byte_offset(content, 2, 3), 15);
     }
 }

@@ -1,161 +1,160 @@
-# QWASR Lint
+# Omnia Lint
 
-A custom Rust linter for QWASR WASM32 handler development. This linter enforces best practices, detects forbidden patterns, and validates Handler implementations for WASM32 targets.
+A custom Rust linter for [Omnia](https://github.com/augentic/omnia) WASM32 handler development. It enforces WASI component constraints, validates `Handler` trait implementations, detects forbidden crates/APIs, and checks provider trait bounds -- including transitive usage through function delegation.
 
-## Features
+## Why
 
-- **80+ Validation Rules** across 13 categories
-- **Semantic Analysis** for provider trait bound checking
-- **Multiple Output Formats**: Pretty, JSON, Compact, GitHub Actions
-- **Parallel Processing** for fast linting of large codebases
-- **Configurable Severity Levels**
-- **Rule Category Filtering**
-- **Inline Ignore Directives** using `#[qwasr::allow(...)]` attributes
+Omnia handlers compile to `wasm32-wasip2` and run inside a sandboxed runtime. Standard Rust patterns that work on native targets (filesystem access, threading, direct HTTP clients, global mutable state) will either fail to compile or panic at runtime in this environment. This linter catches those issues at development time, before they reach CI or production.
 
-## Installation
-
-### From Source
+## Install
 
 ```bash
-cd custom-linter
 cargo install --path .
 ```
 
-### As a Dependency
-
-Add to your `Cargo.toml`:
+Or add as a dev-dependency for programmatic use:
 
 ```toml
 [dev-dependencies]
-qwasr-lint = { path = "../custom-linter" }
+omnia-lint = { path = "../lints" }
 ```
 
-## Usage
-
-### Command Line
+## Quick Start
 
 ```bash
-# Lint a single file
-qwasr-lint src/handler.rs
+# Lint a directory
+omnia-lint src/
 
-# Lint a directory recursively
-qwasr-lint src/
+# Lint specific files
+omnia-lint src/handler.rs src/routes.rs
 
-# Lint multiple paths
-qwasr-lint src/ tests/
+# Show only errors and warnings (skip info/hint)
+omnia-lint src/ --severity warning
 
-# Output as JSON
-qwasr-lint src/ --format json
+# JSON output for tooling
+omnia-lint src/ --format json
 
-# Only show errors and warnings
-qwasr-lint src/ --severity warning
-
-# Filter by category
-qwasr-lint src/ --categories handler,wasm,error
-
-# Disable specific rules
-qwasr-lint src/ --disable error_generic_unwrap,println_debug
-
-# GitHub Actions output
-qwasr-lint src/ --format github
-
-# Show statistics
-qwasr-lint src/ --stats
+# GitHub Actions annotations
+omnia-lint src/ --format github --error-on-warnings
 ```
 
-### As a Library
+## What It Checks
+
+### Forbidden Crates (~35 crates)
+
+Crates that are incompatible with WASM32 are flagged on `use` or `extern crate`:
+
+| Category | Crates | Alternative |
+|----------|--------|-------------|
+| HTTP clients | `reqwest`, `hyper`, `surf`, `ureq` | `HttpRequest` provider trait |
+| Async runtimes | `tokio`, `async-std`, `smol` | WASI provides the executor |
+| Databases | `sqlx`, `diesel`, `postgres`, `mysql` | `TableStore` provider trait |
+| Redis/caching | `redis`, `fred` | `StateStore` provider trait |
+| Messaging | `rdkafka`, `lapin` | `Publish` provider trait |
+| Parallelism | `rayon`, `crossbeam` | Sequential iterators (WASM is single-threaded) |
+| Global state | `once_cell`, `lazy_static` | `Config` provider trait |
+
+### Forbidden Patterns (11 patterns)
+
+Source patterns that won't work or are dangerous in WASM32:
+
+- `static mut`, `OnceCell`, `LazyLock` -- global mutable state
+- `std::fs`, `std::net`, `std::thread`, `std::process`, `std::env` -- unavailable APIs
+- `SystemTime::now()`, `thread::sleep` -- unreliable or unavailable
+- `println!`, `eprintln!`, `dbg!` -- use `tracing` instead
+
+### Regex-Based Rules (51 rules across 13 categories)
+
+| Category | What it checks |
+|----------|---------------|
+| Handler | Generic parameter `P`, async `handle`, `Context<'_, P>` lifetime |
+| Provider | Hardcoded config, direct HTTP clients, too many bounds |
+| Error | `unwrap`/`expect`/`panic!`/`assert!`, missing `.context()`, wrong error mapping |
+| Wasm | `std::fs`/`net`/`thread`/`env`/`process`, 64/128-bit integers, `isize`/`usize` in APIs |
+| Stateless | `static mut`, `lazy_static`, `OnceCell`, `Arc<Mutex>` |
+| Performance | Clone in loop, string concatenation, `collect().len()`, unbounded queries |
+| Security | Hardcoded secrets, SQL string concatenation |
+| Strong Typing | Raw `String` IDs, string matching instead of enums, raw `f64` coordinates |
+| Time | `SystemTime::now()`, `Instant::now().elapsed()` |
+| Auth | Hardcoded bearer tokens |
+| Caching | `StateStore::set` without TTL |
+
+### Semantic Analysis (syn-based AST parsing)
+
+The linter parses source files with `syn` to perform deep structural analysis:
+
+- **Unused provider bounds** -- traits declared on `impl<P: Config + HttpRequest>` but never called in the handler body
+- **Missing provider bounds** -- traits used (e.g. `ctx.provider.fetch(...)`) but not declared in bounds
+- **Transitive trait detection** -- if a handler calls `fetch_data(provider)` which requires `HttpRequest`, the bound is traced through the call chain
+- **Handler missing bounds** -- `impl<P> Handler<P>` with no provider traits specified
+- **Helper function bounds** -- the same unused/missing analysis applied to standalone `async fn` helpers
+
+The analyzer also runs regex-based checks for:
+- `Config::get` without `?` or error handling
+- `StateStore::set` with `None` TTL
+- `HttpRequest::fetch` without `.context()`
+
+## Configuration
+
+### Cargo.toml
+
+Configure severity overrides in `[lints.omnia]` or `[workspace.lints.omnia]`, following the same convention as `clippy`:
+
+```toml
+[workspace.lints.omnia]
+all = "warn"
+
+handler  = "deny"
+wasm     = "deny"
+security = "forbid"
+
+error_generic_unwrap = "allow"
+perf_clone_in_loop   = "allow"
+```
+
+Levels: `allow` (suppress), `warn`, `deny` (error), `forbid` (error, cannot be overridden).
+
+### Inline Suppression
+
+Suppress diagnostics with `#[omnia::allow(...)]`, similar to `#[allow(clippy::...)]`:
 
 ```rust
-use qwasr_lint::{Linter, LintConfig, RuleSeverity};
-
-fn main() {
-    let config = LintConfig {
-        min_severity: RuleSeverity::Warning,
-        show_fixes: true,
-        ..Default::default()
-    };
-
-    let linter = Linter::new(config);
-    
-    let diagnostics = linter.lint_file("src/handler.rs").unwrap();
-    
-    for diag in diagnostics {
-        println!("{}", diag);
-    }
+// Suppress a specific rule for the next item
+#[omnia::allow(error_generic_unwrap)]
+fn parse_config(input: &str) -> Config {
+    serde_json::from_str(input).unwrap() // no warning
 }
+
+// Suppress all omnia rules for the next item
+#[omnia::allow(all)]
+fn legacy_handler() { /* ... */ }
+
+// File-level suppression (inner attribute)
+#![omnia::allow(println_debug)]
 ```
 
-## Rule Categories
+### CLI Options
 
-| Category | Description | Count |
-|----------|-------------|-------|
-| **Handler** | Handler trait implementation rules | 8 |
-| **Provider** | Provider trait usage rules | 11 |
-| **Error** | Error handling rules | 19 |
-| **Wasm** | WASM32 compatibility rules | 12 |
-| **Stateless** | Statelessness enforcement | 6 |
-| **Performance** | Performance optimization hints | 5 |
-| **Security** | Security-critical rules | 2 |
-| **StrongTyping** | Type safety recommendations | 3 |
-| **Time** | Time handling rules | 2 |
-| **Auth** | Authentication rules | 2 |
-| **Caching** | Cache usage rules | 2 |
+```
+omnia-lint [OPTIONS] <PATHS>...
 
-## Key Rules
-
-### Critical Errors (Must Fix)
-
-| Rule ID | Description |
-|---------|-------------|
-| `error_panic_macro` | No `panic!` in WASM handlers |
-| `error_unreachable` | No `unreachable!` macro |
-| `error_assert` | No `assert!` in handlers |
-| `wasm_std_fs` | No `std::fs` access |
-| `wasm_std_net` | No `std::net` access |
-| `wasm_std_thread` | No `std::thread` usage |
-| `stateless_static_mut` | No `static mut` state |
-| `security_sql_concat` | No SQL string concatenation |
-| `forbidden_tokio` | No Tokio runtime |
-
-### Warnings (Should Fix)
-
-| Rule ID | Description |
-|---------|-------------|
-| `error_generic_unwrap` | Avoid `.unwrap()` and `.expect()` |
-| `handler_context_lifetime` | Use `Context<'_, P>` lifetime |
-| `provider_bounds_minimal` | Declare only used provider traits |
-| `cache_missing_ttl` | StateStore::set should have TTL |
-
-### Semantic Analysis
-
-The linter performs deep semantic analysis to detect:
-
-- **Unused Provider Bounds**: Traits declared but never used
-- **Missing Provider Bounds**: Traits used but not declared
-- **StateStore TTL Issues**: Cache operations without expiration
-
-## Forbidden Crates
-
-The following crates are not compatible with WASM32:
-
-| Category | Crates |
-|----------|--------|
-| HTTP Clients | `reqwest`, `hyper`, `surf`, `ureq` |
-| Async Runtimes | `tokio`, `async-std`, `smol` |
-| Databases | `sqlx`, `diesel`, `postgres`, `mysql` |
-| Parallelism | `rayon`, `crossbeam` |
-| Global State | `once_cell`, `lazy_static` |
-| Messaging | `rdkafka`, `lapin` |
+Options:
+  -f, --format <FORMAT>        pretty | json | compact | github [default: pretty]
+  -s, --severity <SEVERITY>    error | warning | info | hint [default: hint]
+  -c, --categories <CATS>      Comma-separated category filter
+      --disable <RULES>        Comma-separated rule IDs to disable
+      --show-fixes             Show fix suggestions [default: true]
+      --error-on-warnings      Exit 1 on warnings (for CI)
+  -q, --quiet                  Only show files with diagnostics
+      --stats                  Show per-rule hit counts
+      --max-diagnostics <N>    Limit output (0 = unlimited) [default: 0]
+```
 
 ## Output Formats
 
-### Pretty (Default)
+**Pretty** (default) -- colored output with source snippets and fix suggestions.
 
-Human-readable colored output with source snippets and fix suggestions.
-
-### JSON
-
-Structured output for tooling integration:
+**JSON** -- structured array for tooling integration:
 
 ```json
 [
@@ -171,114 +170,80 @@ Structured output for tooling integration:
 ]
 ```
 
-### Compact
+**Compact** -- one line per diagnostic: `src/handler.rs:10:5: E [error_panic_macro] Never use panic!...`
 
-One diagnostic per line:
-
-```
-src/handler.rs:10:5: E [error_panic_macro] Never use panic! in WASM handlers
-```
-
-### GitHub Actions
-
-Native GitHub Actions annotation format for CI integration.
+**GitHub** -- native GitHub Actions annotation format (`::error file=...`).
 
 ## CI Integration
 
 ### GitHub Actions
 
 ```yaml
-- name: Run QWASR Lint
+- name: Omnia Lint
   run: |
-    cargo install --path custom-linter
-    qwasr-lint src/ --format github --error-on-warnings
+    cargo install --path lints
+    omnia-lint src/ --format github --error-on-warnings
 ```
 
 ### Pre-commit Hook
 
 ```bash
 #!/bin/bash
-qwasr-lint src/ --severity warning --quiet
-if [ $? -ne 0 ]; then
-    echo "Linting failed. Please fix the issues above."
-    exit 1
-fi
+omnia-lint src/ --severity warning --quiet
 ```
 
-## Configuration
-
-### Inline Ignore Directives
-
-You can suppress specific lint warnings using `#[qwasr::allow(...)]` attributes, similar to Clippy's `#[allow(...)]`.
-
-#### Ignore all rules for the next item
+## Library API
 
 ```rust
-#[qwasr::allow(all)]
-fn my_function() {
-    let x = Some(5).unwrap();  // No warning
+use omnia_lint::{Linter, LintConfig, RuleSeverity};
+
+let config = LintConfig {
+    min_severity: RuleSeverity::Warning,
+    ..Default::default()
+};
+
+let linter = Linter::new(config);
+let diagnostics = linter.lint_file("src/handler.rs").unwrap();
+
+for diag in &diagnostics {
+    println!("{}", diag);
 }
 ```
 
-#### Ignore specific rule(s)
+Or lint a string directly:
 
 ```rust
-#[qwasr::allow(unwrap_used)]
-fn my_function() {
-    let x = Some(5).unwrap();  // No warning for unwrap_used
-}
-
-// Multiple rules can be specified
-#[qwasr::allow(unwrap_used, expect_used)]
-fn my_function() {
-    let x = Some(5).unwrap();
-    let y = Some(6).expect("msg");  // Both ignored
-}
+let diagnostics = linter.lint_str(source_code, "handler.rs");
 ```
-
-#### File-level ignore (inner attribute)
-
-Use `#!` for file-wide suppression:
-
-```rust
-#![qwasr::allow(all)]  // Ignore all rules in this file
-
-fn my_function() {
-    let x = Some(5).unwrap();  // No warning
-}
-```
-
-```rust
-#![qwasr::allow(forbidden_crate_tokio)]  // Only ignore tokio warnings file-wide
-
-use tokio::runtime::Runtime;  // No warning
-```
-
-### LintConfig Options
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `all_rules` | bool | true | Enable all rules |
-| `categories` | Vec | [] | Filter by categories |
-| `disabled_rules` | Vec | [] | Rules to disable |
-| `min_severity` | Severity | Hint | Minimum severity to report |
-| `show_fixes` | bool | true | Show fix suggestions |
 
 ## Exit Codes
 
 | Code | Meaning |
 |------|---------|
-| 0 | No errors (warnings may be present) |
-| 1 | One or more errors found |
-| 1 | Warnings found (with `--error-on-warnings`) |
+| 0 | No errors found |
+| 1 | Errors found, or warnings found with `--error-on-warnings` |
+
+## Architecture
+
+```
+src/
+  main.rs          CLI entry point (clap, rayon parallel linting)
+  lib.rs           Linter API, LintConfig, filtering
+  diagnostics.rs   DiagnosticsEngine: orchestrates rules, constraints, semantic analysis
+  rules.rs         51 regex-based rules defined via rule! macro
+  constraints.rs   Forbidden crates and patterns
+  semantic.rs      syn-based AST analysis (Handler bounds, transitive traits)
+  config.rs        Cargo.toml [lints.omnia] discovery and parsing
+  output.rs        Pretty, JSON, Compact, GitHub formatters
+```
 
 ## Contributing
 
-1. Add new rules in `src/rules.rs`
-2. Add forbidden patterns in `src/constraints.rs`
-3. Extend semantic analysis in `src/semantic.rs`
-4. Run tests: `cargo test`
-5. Build: `cargo build --release`
+1. **Add a rule**: use the `rule!` macro in `src/rules.rs`
+2. **Add a forbidden pattern**: add to `forbidden_patterns()` in `src/constraints.rs`
+3. **Extend semantic analysis**: modify the `syn` visitors in `src/semantic.rs`
+4. **Run tests**: `cargo test` (56 tests across all modules)
+5. **Check style**: `cargo clippy`
 
 ## License
 

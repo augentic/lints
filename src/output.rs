@@ -25,10 +25,7 @@ pub enum OutputFormat {
 
 /// Format diagnostics according to the specified output format.
 pub fn format_diagnostics(
-    file: &Path,
-    diagnostics: &[Diagnostic],
-    format: OutputFormat,
-    show_fixes: bool,
+    file: &Path, diagnostics: &[Diagnostic], format: OutputFormat, show_fixes: bool,
 ) -> String {
     match format {
         OutputFormat::Pretty => format_pretty(file, diagnostics, show_fixes),
@@ -47,10 +44,7 @@ fn format_pretty(file: &Path, diagnostics: &[Diagnostic], show_fixes: bool) -> S
     let mut output = String::new();
 
     // File header
-    output.push_str(&format!(
-        "\n{}\n",
-        file.display().to_string().bold().underline()
-    ));
+    output.push_str(&format!("\n{}\n", file.display().to_string().bold().underline()));
 
     for diag in diagnostics {
         let severity_str = match diag.severity {
@@ -107,14 +101,10 @@ fn format_pretty(file: &Path, diagnostics: &[Diagnostic], show_fixes: bool) -> S
         }
 
         // Fix suggestion
-        if show_fixes {
-            if let Some(ref fix) = diag.fix_template {
-                output.push_str(&format!(
-                    "\n    {} {}\n",
-                    "Fix:".green().bold(),
-                    fix.green()
-                ));
-            }
+        if show_fixes
+            && let Some(ref fix) = diag.fix_template
+        {
+            output.push_str(&format!("\n    {} {}\n", "Fix:".green().bold(), fix.green()));
         }
     }
 
@@ -143,7 +133,7 @@ fn format_json(file: &Path, diagnostics: &[Diagnostic]) -> String {
         })
         .collect();
 
-    serde_json::to_string_pretty(&json_diagnostics).unwrap_or_default()
+    serde_json::to_string_pretty(&json_diagnostics).expect("serializing diagnostics to JSON")
 }
 
 /// Format diagnostics in compact one-line format.
@@ -193,15 +183,35 @@ fn format_github(file: &Path, diagnostics: &[Diagnostic]) -> String {
             diag.column,
             diag.end_column,
             diag.rule_id,
-            diag.message
-                .lines()
-                .next()
-                .unwrap_or("")
-                .replace('\n', "\\n")
+            diag.message.lines().next().unwrap_or("").replace('\n', "\\n")
         ));
     }
 
     output
+}
+
+/// Format all diagnostics across files as a single JSON array.
+pub fn format_json_all(diagnostics: &[(&Path, &Diagnostic)]) -> String {
+    let json_diagnostics: Vec<serde_json::Value> = diagnostics
+        .iter()
+        .map(|(file, diag)| {
+            serde_json::json!({
+                "file": file.display().to_string(),
+                "line": diag.line,
+                "column": diag.column,
+                "end_column": diag.end_column,
+                "severity": format!("{:?}", diag.severity).to_lowercase(),
+                "rule_id": diag.rule_id,
+                "rule_name": diag.rule_name,
+                "category": format!("{:?}", diag.category),
+                "message": diag.message,
+                "fix": diag.fix_template,
+                "source": diag.source_snippet,
+            })
+        })
+        .collect();
+
+    serde_json::to_string_pretty(&json_diagnostics).expect("serializing diagnostics to JSON")
 }
 
 /// Summary statistics for diagnostics.
@@ -219,8 +229,10 @@ pub struct DiagnosticSummary {
 impl DiagnosticSummary {
     /// Create a summary from diagnostics.
     pub fn from_diagnostics(diagnostics: &[Diagnostic]) -> Self {
-        let mut summary = Self::default();
-        summary.total = diagnostics.len();
+        let mut summary = Self {
+            total: diagnostics.len(),
+            ..Self::default()
+        };
 
         for diag in diagnostics {
             match diag.severity {
@@ -242,11 +254,7 @@ impl DiagnosticSummary {
             self.errors.to_string().red().bold(),
             if self.errors == 1 { "error" } else { "errors" },
             self.warnings.to_string().yellow().bold(),
-            if self.warnings == 1 {
-                "warning"
-            } else {
-                "warnings"
-            },
+            if self.warnings == 1 { "warning" } else { "warnings" },
             self.info,
             self.hints
         )
@@ -308,5 +316,52 @@ mod tests {
         assert_eq!(summary.errors, 1);
         assert_eq!(summary.warnings, 1);
         assert_eq!(summary.info, 1);
+    }
+
+    #[test]
+    fn test_format_pretty_contains_rule_info() {
+        let diag = create_test_diagnostic();
+        let output = format_pretty(Path::new("test.rs"), &[diag], true);
+        assert!(output.contains("test_rule"), "Should contain the rule ID");
+        assert!(output.contains("Test Rule"), "Should contain the rule name");
+        assert!(output.contains("test message"), "Should contain the message");
+        assert!(output.contains("Fix suggestion"), "Should contain fix when show_fixes=true");
+    }
+
+    #[test]
+    fn test_format_pretty_hides_fix_when_disabled() {
+        let diag = create_test_diagnostic();
+        let output = format_pretty(Path::new("test.rs"), &[diag], false);
+        assert!(!output.contains("Fix suggestion"), "Should not show fix when show_fixes=false");
+    }
+
+    #[test]
+    fn test_format_pretty_empty_diagnostics() {
+        let output = format_pretty(Path::new("test.rs"), &[], true);
+        assert!(output.is_empty(), "Empty diagnostics should produce empty output");
+    }
+
+    #[test]
+    fn test_format_json_structure() {
+        let diag = create_test_diagnostic();
+        let output = format_json(Path::new("test.rs"), &[diag]);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["rule_id"], "test_rule");
+        assert_eq!(parsed[0]["line"], 10);
+        assert_eq!(parsed[0]["severity"], "error");
+    }
+
+    #[test]
+    fn test_format_json_all_multiple_files() {
+        let diag = create_test_diagnostic();
+        let path_a = Path::new("a.rs");
+        let path_b = Path::new("b.rs");
+        let items: Vec<(&Path, &Diagnostic)> = vec![(path_a, &diag), (path_b, &diag)];
+        let output = format_json_all(&items);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["file"], "a.rs");
+        assert_eq!(parsed[1]["file"], "b.rs");
     }
 }
